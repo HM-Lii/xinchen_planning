@@ -1,145 +1,100 @@
-# CarND-Path-Planning-Project
-Self-Driving Car Engineer Nanodegree Program
-   
-### Simulator.
-You can download the Term3 Simulator which contains the Path Planning Project from the [releases tab (https://github.com/udacity/self-driving-car-sim/releases/tag/T3_v1.2).  
+# 自动驾驶路径规划离线任务
 
-To run the simulator on Mac/Linux, first make the binary file executable with the following command:
+本项目基于游戏模拟器和C++编程语言，涉及自动驾驶中的规划控制。您可以选择任何操作系统和IDE来完成此项目。
+
+
+## 代码和报告提交要求
+
+### 代码风格
+
+请尽力遵循[Google C++代码风格指南](https://google.github.io/styleguide/cppguide.html)。
+
+
+您可以通过创建zip/tar压缩文件直接发送给我们来提交作品，或者将仓库推送到GitHub或GitLab等平台并分享链接。**但请注意，请勿公开分享此项目。** 您可以在大多数网站上分享私有仓库，例如在GitHub上创建私有仓库并[邀请协作者](https://docs.github.com/zh/account-and-profile/setting-up-and-managing-your-personal-account-on-github/managing-access-to-your-personal-repositories/inviting-collaborators-to-a-personal-repository)。
+
+### 评分标准
+
+评审将基于以下几个方面：
+
+* 您的研究报告，详细解释每一步的思考过程
+* 代码质量及问题回答质量
+* 代码和环境的可复现性
+
+研究报告最好以PDF格式提交，但如果您偏好其他格式（如Markdown或Jupyter Notebook）也可以。您提供的C++代码应至少通过初始化Git仓库并进行一次提交来进行版本控制。
+
+如果您有具体问题或感到卡住无法进展，请直接联系我们。
+
+## 任务目标
+本项目需要您实现一个算法在虚拟高速公路上安全导航，其他车辆将以限速50英里/小时的±10英里/小时速度行驶。您将获得车辆定位数据和传感器融合数据，以及高速公路的稀疏地图航点列表。车辆应尽可能接近50英里/小时的限速行驶，这意味着需要适时超越慢车（请注意其他车辆也会变换车道）。车辆必须不惜一切代价避免碰撞，并且始终在标记车道内行驶（变道期间除外）。车辆需要完整绕行6946米长的高速公路一圈。以50英里/小时速度行驶时，单圈耗时约5分多钟。同时车辆总加速度不得超过10 m/s²，加加速度（jerk）不得超过10 m/s³。
+
+### 高速公路地图位于data/highway_map.csv
+每个航点包含[x,y,s,dx,dy]值：x和y是航点的地图坐标位置，s值是沿道路到该航点的距离（米），dx和dy定义指向高速公路环线外侧的单位法向量。
+
+高速公路航点呈环状分布，因此frenet坐标的s值（沿道路距离）从0到6945.554循环。
+
+### 模拟器向C++程序提供的数据
+
+#### 主车定位数据（无噪声）
+
+["x"] 车辆在地图坐标系中的x坐标  
+["y"] 车辆在地图坐标系中的y坐标  
+["s"] 车辆在frenet坐标系中的s坐标  
+["d"] 车辆在frenet坐标系中的d坐标  
+["yaw"] 车辆在地图中的偏航角  
+["speed"] 车辆速度（英里/小时）
+
+#### 提供给规划器的历史路径数据
+
+//注意：需返回已处理点被移除后的历史点列表，这可有效显示自上次处理后路径的进展程度
+
+["previous_path_x"] 之前提供给模拟器的x点列表  
+["previous_path_y"] 之前提供给模拟器的y点列表
+
+#### 历史路径的终点s和d值
+
+["end_path_s"] 历史路径最后一个点的frenet s值  
+["end_path_d"] 历史路径最后一个点的frenet d值
+
+#### 传感器融合数据：同侧道路上所有其他车辆的属性列表（无噪声）
+
+["sensor_fusion"] 二维车辆向量，包含[车辆唯一ID, 车辆在地图坐标系中的x坐标, 车辆在地图坐标系中的y坐标, 车辆x方向速度(m/s), 车辆y方向速度(m/s), 车辆在frenet坐标系中的s坐标, 车辆在frenet坐标系中的d坐标]
+
+
+### 模拟器
+如果遇到模拟器卡顿的情况，请使用全屏模式。
+
+在Mac/Linux系统上运行模拟器时，请先通过以下命令赋予二进制文件可执行权限：
 ```shell
-sudo chmod u+x {simulator_file_name}
+sudo chmod u+x {模拟器文件名}
 ```
 
-### Goals
-In this project your goal is to safely navigate around a virtual highway with other traffic that is driving +-10 MPH of the 50 MPH speed limit. You will be provided the car's localization and sensor fusion data, there is also a sparse map list of waypoints around the highway. The car should try to go as close as possible to the 50 MPH speed limit, which means passing slower traffic when possible, note that other cars will try to change lanes too. The car should avoid hitting other cars at all cost as well as driving inside of the marked road lanes at all times, unless going from one lane to another. The car should be able to make one complete loop around the 6946m highway. Since the car is trying to go 50 MPH, it should take a little over 5 minutes to complete 1 loop. Also the car should not experience total acceleration over 10 m/s^2 and jerk that is greater than 10 m/s^3.
+### 环境依赖
 
-#### The map of the highway is in data/highway_map.txt
-Each waypoint in the list contains  [x,y,s,dx,dy] values. x and y are the waypoint's map coordinate position, the s value is the distance along the road to get to that waypoint in meters, the dx and dy values define the unit normal vector pointing outward of the highway loop.
+* cmake >= 3.5  
+  * 所有操作系统：[安装说明](https://cmake.org/install/)
+* make >= 4.1  
+  * Linux：大多数发行版默认安装
+  * Mac：[安装Xcode命令行工具](https://developer.apple.com/xcode/features/)
+  * Windows：[安装说明](http://gnuwin32.sourceforge.net/packages/make.htm)
+* gcc/g++ >= 5.4  
+  * Linux：大多数发行版默认安装
+  * Mac：与make相同-[安装Xcode命令行工具](https://developer.apple.com/xcode/features/)
+  * Windows：推荐使用[MinGW](http://www.mingw.org/)
+* Boost >= 1.66（需要Boost.System和Boost.Beast）
+  * Ubuntu：运行`bash ./install-ubuntu.sh`
+  * macOS：运行`bash ./install-mac.sh`
 
-The highway's waypoints loop around so the frenet s value, distance along the road, goes from 0 to 6945.554.
+### 构建与运行
 
-## Basic Build Instructions
+```shell
+cmake -S . -B build
+cmake --build build --parallel
+cd build
+./path_planning
+```
 
-1. Clone this repo.
-2. Make a build directory: `mkdir build && cd build`
-3. Compile: `cmake .. && make`
-4. Run it: `./path_planning`.
+程序会从构建目录中的`data/highway_map.csv`读取地图，并监听本机`4567`端口。随后启动模拟器即可连接规划程序。
 
-Here is the data provided from the Simulator to the C++ Program
+## 声明
 
-#### Main car's localization Data (No Noise)
-
-["x"] The car's x position in map coordinates
-
-["y"] The car's y position in map coordinates
-
-["s"] The car's s position in frenet coordinates
-
-["d"] The car's d position in frenet coordinates
-
-["yaw"] The car's yaw angle in the map
-
-["speed"] The car's speed in MPH
-
-#### Previous path data given to the Planner
-
-//Note: Return the previous list but with processed points removed, can be a nice tool to show how far along
-the path has processed since last time. 
-
-["previous_path_x"] The previous list of x points previously given to the simulator
-
-["previous_path_y"] The previous list of y points previously given to the simulator
-
-#### Previous path's end s and d values 
-
-["end_path_s"] The previous list's last point's frenet s value
-
-["end_path_d"] The previous list's last point's frenet d value
-
-#### Sensor Fusion Data, a list of all other car's attributes on the same side of the road. (No Noise)
-
-["sensor_fusion"] A 2d vector of cars and then that car's [car's unique ID, car's x position in map coordinates, car's y position in map coordinates, car's x velocity in m/s, car's y velocity in m/s, car's s position in frenet coordinates, car's d position in frenet coordinates. 
-
-## Details
-
-1. The car uses a perfect controller and will visit every (x,y) point it recieves in the list every .02 seconds. The units for the (x,y) points are in meters and the spacing of the points determines the speed of the car. The vector going from a point to the next point in the list dictates the angle of the car. Acceleration both in the tangential and normal directions is measured along with the jerk, the rate of change of total Acceleration. The (x,y) point paths that the planner recieves should not have a total acceleration that goes over 10 m/s^2, also the jerk should not go over 50 m/s^3. (NOTE: As this is BETA, these requirements might change. Also currently jerk is over a .02 second interval, it would probably be better to average total acceleration over 1 second and measure jerk from that.
-
-2. There will be some latency between the simulator running and the path planner returning a path, with optimized code usually its not very long maybe just 1-3 time steps. During this delay the simulator will continue using points that it was last given, because of this its a good idea to store the last points you have used so you can have a smooth transition. previous_path_x, and previous_path_y can be helpful for this transition since they show the last points given to the simulator controller with the processed points already removed. You would either return a path that extends this previous path or make sure to create a new path that has a smooth transition with this last path.
-
-## Tips
-
-A really helpful resource for doing this project and creating smooth trajectories was using http://kluge.in-chemnitz.de/opensource/spline/, the spline function is in a single hearder file is really easy to use.
-
----
-
-## Dependencies
-
-* cmake >= 3.5
-  * All OSes: [click here for installation instructions](https://cmake.org/install/)
-* make >= 4.1
-  * Linux: make is installed by default on most Linux distros
-  * Mac: [install Xcode command line tools to get make](https://developer.apple.com/xcode/features/)
-  * Windows: [Click here for installation instructions](http://gnuwin32.sourceforge.net/packages/make.htm)
-* gcc/g++ >= 5.4
-  * Linux: gcc / g++ is installed by default on most Linux distros
-  * Mac: same deal as make - [install Xcode command line tools]((https://developer.apple.com/xcode/features/)
-  * Windows: recommend using [MinGW](http://www.mingw.org/)
-* [uWebSockets](https://github.com/uWebSockets/uWebSockets)
-  * Run either `install-mac.sh` or `install-ubuntu.sh`.
-  * If you install from source, checkout to commit `e94b6e1`, i.e.
-    ```
-    git clone https://github.com/uWebSockets/uWebSockets 
-    cd uWebSockets
-    git checkout e94b6e1
-    ```
-
-## Editor Settings
-
-We've purposefully kept editor configuration files out of this repo in order to
-keep it as simple and environment agnostic as possible. However, we recommend
-using the following settings:
-
-* indent using spaces
-* set tab width to 2 spaces (keeps the matrices in source code aligned)
-
-## Code Style
-
-Please (do your best to) stick to [Google's C++ style guide](https://google.github.io/styleguide/cppguide.html).
-
-## Project Instructions and Rubric
-
-Note: regardless of the changes you make, your project must be buildable using
-cmake and make!
-
-
-## Call for IDE Profiles Pull Requests
-
-Help your fellow students!
-
-We decided to create Makefiles with cmake to keep this project as platform
-agnostic as possible. Similarly, we omitted IDE profiles in order to ensure
-that students don't feel pressured to use one IDE or another.
-
-However! I'd love to help people get up and running with their IDEs of choice.
-If you've created a profile for an IDE that you think other students would
-appreciate, we'd love to have you add the requisite profile files and
-instructions to ide_profiles/. For example if you wanted to add a VS Code
-profile, you'd add:
-
-* /ide_profiles/vscode/.vscode
-* /ide_profiles/vscode/README.md
-
-The README should explain what the profile does, how to take advantage of it,
-and how to install it.
-
-Frankly, I've never been involved in a project with multiple IDE profiles
-before. I believe the best way to handle this would be to keep them out of the
-repo root to avoid clutter. My expectation is that most profiles will include
-instructions to copy files to a new location to get picked up by the IDE, but
-that's just a guess.
-
-One last note here: regardless of the IDE used, every submitted project must
-still be compilable with cmake and make./
-
-## How to write a README
-A well written README file can enhance your project and portfolio.  Develop your abilities to create professional README files by completing [this free course](https://www.udacity.com/course/writing-readmes--ud777).
-
+本项目基于Udacity的无人驾驶汽车纳米学位项目，并遵循其版权声明。
