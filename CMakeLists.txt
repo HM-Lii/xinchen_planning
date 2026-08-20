@@ -1,26 +1,22 @@
-project(Path_Planning)
+cmake_minimum_required(VERSION 3.5)
 
-cmake_minimum_required (VERSION 3.5)
+project(Path_Planning LANGUAGES CXX)
 
-add_definitions(-std=c++11)
+find_package(Boost 1.66 REQUIRED COMPONENTS system)
+find_package(Threads REQUIRED)
 
-set(CXX_FLAGS "-Wall")
-set(CMAKE_CXX_FLAGS, "${CXX_FLAGS}")
+add_executable(path_planning src/main.cpp)
 
-set(sources src/main.cpp)
+set_target_properties(path_planning PROPERTIES
+  CXX_STANDARD 11
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+)
 
+target_include_directories(path_planning PRIVATE ${Boost_INCLUDE_DIRS})
+target_compile_options(path_planning PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(path_planning PRIVATE ${Boost_LIBRARIES} Threads::Threads)
 
-if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin") 
-
-include_directories(/usr/local/include)
-include_directories(/usr/local/opt/openssl/include)
-link_directories(/usr/local/lib)
-link_directories(/usr/local/opt/openssl/lib)
-link_directories(/usr/local/Cellar/libuv/1.11.0/lib)
-
-endif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin") 
-
-
-add_executable(path_planning ${sources})
-
-target_link_libraries(path_planning z ssl uv uWS)
+# Keep runtime data next to the binary so the executable can be launched
+# directly from the build directory.
+file(COPY data DESTINATION ${CMAKE_CURRENT_BINARY_DIR})

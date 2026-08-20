@@ -45,7 +45,7 @@ int ClosestWaypoint(double x, double y, const vector<double> &maps_x,
   double closestLen = 100000; //large number
   int closestWaypoint = 0;
 
-  for (int i = 0; i < maps_x.size(); ++i) {
+  for (int i = 0; i < static_cast<int>(maps_x.size()); ++i) {
     double map_x = maps_x[i];
     double map_y = maps_y[i];
     double dist = distance(x,y,map_x,map_y);
@@ -73,7 +73,7 @@ int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x,
 
   if (angle > pi()/2) {
     ++closestWaypoint;
-    if (closestWaypoint == maps_x.size()) {
+    if (closestWaypoint == static_cast<int>(maps_x.size())) {
       closestWaypoint = 0;
     }
   }
