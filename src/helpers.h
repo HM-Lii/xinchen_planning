@@ -1,157 +1,158 @@
 #ifndef HELPERS_H
 #define HELPERS_H
 
-#include <math.h>
+// Compatibility helpers retained for existing student code. New code should
+// use map.h and simulator_protocol.h, whose interfaces validate their inputs.
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-// for convenience
 using std::string;
 using std::vector;
 
-// Checks if the SocketIO event has JSON data.
-// If there is data the JSON object in string format will be returned,
-//   else the empty string "" will be returned.
-string hasData(string s) {
-  auto found_null = s.find("null");
-  auto b1 = s.find_first_of("[");
-  auto b2 = s.find_first_of("}");
-  if (found_null != string::npos) {
+inline string hasData(const string &value) {
+  const std::size_t array_start = value.find('[');
+  if (array_start == string::npos) {
     return "";
-  } else if (b1 != string::npos && b2 != string::npos) {
-    return s.substr(b1, b2 - b1 + 2);
   }
-  return "";
+  return value.substr(array_start);
 }
 
-//
-// Helper functions related to waypoints and converting from XY to Frenet
-//   or vice versa
-//
+constexpr double pi() { return 3.14159265358979323846; }
+inline double deg2rad(double value) { return value * pi() / 180.0; }
+inline double rad2deg(double value) { return value * 180.0 / pi(); }
 
-// For converting back and forth between radians and degrees.
-constexpr double pi() { return M_PI; }
-double deg2rad(double x) { return x * pi() / 180; }
-double rad2deg(double x) { return x * 180 / pi(); }
-
-// Calculate distance between two points
-double distance(double x1, double y1, double x2, double y2) {
-  return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
+inline double distance(double x1, double y1, double x2, double y2) {
+  return std::hypot(x2 - x1, y2 - y1);
 }
 
-// Calculate closest waypoint to current x, y position
-int ClosestWaypoint(double x, double y, const vector<double> &maps_x, 
-                    const vector<double> &maps_y) {
-  double closestLen = 100000; //large number
-  int closestWaypoint = 0;
+inline void ValidateCoordinates(const vector<double> &maps_x,
+                                const vector<double> &maps_y) {
+  if (maps_x.size() < 2 || maps_x.size() != maps_y.size()) {
+    throw std::invalid_argument(
+        "waypoint x/y arrays must have equal lengths of at least two");
+  }
+}
 
-  for (int i = 0; i < static_cast<int>(maps_x.size()); ++i) {
-    double map_x = maps_x[i];
-    double map_y = maps_y[i];
-    double dist = distance(x,y,map_x,map_y);
-    if (dist < closestLen) {
-      closestLen = dist;
-      closestWaypoint = i;
+inline int ClosestWaypoint(double x, double y, const vector<double> &maps_x,
+                           const vector<double> &maps_y) {
+  ValidateCoordinates(maps_x, maps_y);
+  double closest_length = std::numeric_limits<double>::max();
+  int closest_waypoint = 0;
+  for (std::size_t i = 0; i < maps_x.size(); ++i) {
+    const double candidate = distance(x, y, maps_x[i], maps_y[i]);
+    if (candidate < closest_length) {
+      closest_length = candidate;
+      closest_waypoint = static_cast<int>(i);
+    }
+  }
+  return closest_waypoint;
+}
+
+inline int NextWaypoint(double x, double y, double theta,
+                        const vector<double> &maps_x,
+                        const vector<double> &maps_y) {
+  int closest_waypoint = ClosestWaypoint(x, y, maps_x, maps_y);
+  const double heading =
+      std::atan2(maps_y[closest_waypoint] - y, maps_x[closest_waypoint] - x);
+  double angle = std::fabs(theta - heading);
+  angle = std::fmod(angle, 2.0 * pi());
+  angle = std::min(2.0 * pi() - angle, angle);
+  if (angle > pi() / 2.0) {
+    closest_waypoint = (closest_waypoint + 1) % static_cast<int>(maps_x.size());
+  }
+  return closest_waypoint;
+}
+
+inline vector<double> getFrenet(double x, double y, double theta,
+                                const vector<double> &maps_x,
+                                const vector<double> &maps_y) {
+  ValidateCoordinates(maps_x, maps_y);
+  const int next_waypoint = NextWaypoint(x, y, theta, maps_x, maps_y);
+  const int previous_waypoint =
+      (next_waypoint + static_cast<int>(maps_x.size()) - 1) %
+      static_cast<int>(maps_x.size());
+
+  const double segment_x = maps_x[next_waypoint] - maps_x[previous_waypoint];
+  const double segment_y = maps_y[next_waypoint] - maps_y[previous_waypoint];
+  const double position_x = x - maps_x[previous_waypoint];
+  const double position_y = y - maps_y[previous_waypoint];
+  const double segment_length_squared =
+      segment_x * segment_x + segment_y * segment_y;
+  if (segment_length_squared <= 1e-12) {
+    throw std::invalid_argument("map contains a zero-length segment");
+  }
+
+  const double projection = (position_x * segment_x + position_y * segment_y) /
+                            segment_length_squared;
+  const double projection_x = projection * segment_x;
+  const double projection_y = projection * segment_y;
+  double frenet_d =
+      distance(position_x, position_y, projection_x, projection_y);
+  const double cross = segment_x * position_y - segment_y * position_x;
+  if (cross > 0.0) {
+    frenet_d *= -1.0;
+  }
+
+  double frenet_s = 0.0;
+  for (int i = 0; i < previous_waypoint; ++i) {
+    frenet_s += distance(maps_x[i], maps_y[i], maps_x[i + 1], maps_y[i + 1]);
+  }
+  frenet_s += std::hypot(projection_x, projection_y);
+  return {frenet_s, frenet_d};
+}
+
+inline vector<double> getXY(double s, double d, const vector<double> &maps_s,
+                            const vector<double> &maps_x,
+                            const vector<double> &maps_y) {
+  ValidateCoordinates(maps_x, maps_y);
+  if (maps_s.size() != maps_x.size()) {
+    throw std::invalid_argument("waypoint s/x/y arrays have different lengths");
+  }
+  for (std::size_t i = 1; i < maps_s.size(); ++i) {
+    if (maps_s[i] <= maps_s[i - 1]) {
+      throw std::invalid_argument("waypoint s values must be increasing");
     }
   }
 
-  return closestWaypoint;
+  const double track_length =
+      maps_s.back() +
+      distance(maps_x.back(), maps_y.back(), maps_x.front(), maps_y.front()) -
+      maps_s.front();
+  if (!std::isfinite(s) || !std::isfinite(d) || track_length <= maps_s.back()) {
+    throw std::invalid_argument("invalid Frenet coordinate or track length");
+  }
+  double wrapped_s = std::fmod(s, track_length);
+  if (wrapped_s < 0.0) {
+    wrapped_s += track_length;
+  }
+
+  const auto upper = std::upper_bound(maps_s.begin(), maps_s.end(), wrapped_s);
+  std::size_t previous = 0;
+  std::size_t next = 1;
+  double segment_start_s = maps_s.front();
+  if (upper == maps_s.end()) {
+    previous = maps_s.size() - 1;
+    next = 0;
+    segment_start_s = maps_s.back();
+  } else {
+    next = static_cast<std::size_t>(upper - maps_s.begin());
+    previous = next - 1;
+    segment_start_s = maps_s[previous];
+  }
+
+  const double heading = std::atan2(maps_y[next] - maps_y[previous],
+                                    maps_x[next] - maps_x[previous]);
+  const double segment_s = wrapped_s - segment_start_s;
+  const double segment_x = maps_x[previous] + segment_s * std::cos(heading);
+  const double segment_y = maps_y[previous] + segment_s * std::sin(heading);
+  const double perpendicular_heading = heading - pi() / 2.0;
+  return {segment_x + d * std::cos(perpendicular_heading),
+          segment_y + d * std::sin(perpendicular_heading)};
 }
 
-// Returns next waypoint of the closest waypoint
-int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, 
-                 const vector<double> &maps_y) {
-  int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
-
-  double map_x = maps_x[closestWaypoint];
-  double map_y = maps_y[closestWaypoint];
-
-  double heading = atan2((map_y-y),(map_x-x));
-
-  double angle = fabs(theta-heading);
-  angle = std::min(2*pi() - angle, angle);
-
-  if (angle > pi()/2) {
-    ++closestWaypoint;
-    if (closestWaypoint == static_cast<int>(maps_x.size())) {
-      closestWaypoint = 0;
-    }
-  }
-
-  return closestWaypoint;
-}
-
-// Transform from Cartesian x,y coordinates to Frenet s,d coordinates
-vector<double> getFrenet(double x, double y, double theta, 
-                         const vector<double> &maps_x, 
-                         const vector<double> &maps_y) {
-  int next_wp = NextWaypoint(x,y, theta, maps_x,maps_y);
-
-  int prev_wp;
-  prev_wp = next_wp-1;
-  if (next_wp == 0) {
-    prev_wp  = maps_x.size()-1;
-  }
-
-  double n_x = maps_x[next_wp]-maps_x[prev_wp];
-  double n_y = maps_y[next_wp]-maps_y[prev_wp];
-  double x_x = x - maps_x[prev_wp];
-  double x_y = y - maps_y[prev_wp];
-
-  // find the projection of x onto n
-  double proj_norm = (x_x*n_x+x_y*n_y)/(n_x*n_x+n_y*n_y);
-  double proj_x = proj_norm*n_x;
-  double proj_y = proj_norm*n_y;
-
-  double frenet_d = distance(x_x,x_y,proj_x,proj_y);
-
-  //see if d value is positive or negative by comparing it to a center point
-  double center_x = 1000-maps_x[prev_wp];
-  double center_y = 2000-maps_y[prev_wp];
-  double centerToPos = distance(center_x,center_y,x_x,x_y);
-  double centerToRef = distance(center_x,center_y,proj_x,proj_y);
-
-  if (centerToPos <= centerToRef) {
-    frenet_d *= -1;
-  }
-
-  // calculate s value
-  double frenet_s = 0;
-  for (int i = 0; i < prev_wp; ++i) {
-    frenet_s += distance(maps_x[i],maps_y[i],maps_x[i+1],maps_y[i+1]);
-  }
-
-  frenet_s += distance(0,0,proj_x,proj_y);
-
-  return {frenet_s,frenet_d};
-}
-
-// Transform from Frenet s,d coordinates to Cartesian x,y
-vector<double> getXY(double s, double d, const vector<double> &maps_s, 
-                     const vector<double> &maps_x, 
-                     const vector<double> &maps_y) {
-  int prev_wp = -1;
-
-  while (s > maps_s[prev_wp+1] && (prev_wp < (int)(maps_s.size()-1))) {
-    ++prev_wp;
-  }
-
-  int wp2 = (prev_wp+1)%maps_x.size();
-
-  double heading = atan2((maps_y[wp2]-maps_y[prev_wp]),
-                         (maps_x[wp2]-maps_x[prev_wp]));
-  // the x,y,s along the segment
-  double seg_s = (s-maps_s[prev_wp]);
-
-  double seg_x = maps_x[prev_wp]+seg_s*cos(heading);
-  double seg_y = maps_y[prev_wp]+seg_s*sin(heading);
-
-  double perp_heading = heading-pi()/2;
-
-  double x = seg_x + d*cos(perp_heading);
-  double y = seg_y + d*sin(perp_heading);
-
-  return {x,y};
-}
-
-#endif  // HELPERS_H
+#endif // HELPERS_H
