@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -32,6 +34,16 @@ void RunTest(void (*test)(), const std::string &name) {
   } catch (const std::exception &error) {
     Expect(false, name + " threw: " + error.what());
   }
+}
+
+std::vector<std::string> ReadLines(const std::string &path) {
+  std::ifstream stream(path.c_str());
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(stream, line)) {
+    lines.push_back(line);
+  }
+  return lines;
 }
 
 MapData SquareMap() {
@@ -287,6 +299,51 @@ void TestCartesianRuntimeMonitor() {
   Expect(lane_departure.lane_deviation_violation &&
              lane_departure.HasViolation(),
          "monitor flags departure from the locked lane center");
+}
+
+void TestRuntimeMonitorStartsWithCleanCsvLogs() {
+  const std::string directory = "monitor_test_logs";
+  const std::string cycle_path = directory + "/planner_cycle.csv";
+  const std::string point_path = directory + "/planner_points.csv";
+  const std::string qp_path = directory + "/planner_qp.csv";
+
+  PlannerMonitorConfig config;
+  config.enabled = true;
+  config.write_csv = true;
+  config.log_directory = directory;
+
+  {
+    PlannerRuntimeMonitor first_monitor(config);
+    PlannerCycleDiagnostics first;
+    first.cycle = 1;
+    first.cartesian_samples.push_back(CartesianKinematicSample());
+    first.qp_samples.push_back(QpNodeMonitorSample());
+    first_monitor.Record(first);
+  }
+  {
+    PlannerRuntimeMonitor second_monitor(config);
+    PlannerCycleDiagnostics second;
+    second.cycle = 2;
+    second_monitor.Record(second);
+  }
+
+  const std::vector<std::string> cycle_lines = ReadLines(cycle_path);
+  const std::vector<std::string> point_lines = ReadLines(point_path);
+  const std::vector<std::string> qp_lines = ReadLines(qp_path);
+  Expect(cycle_lines.size() == 2,
+         "a new monitor run replaces the previous cycle log");
+  Expect(cycle_lines.size() == 2 &&
+             cycle_lines[1].find(",2,") != std::string::npos,
+         "the clean cycle log contains only the new run");
+  Expect(point_lines.size() == 1,
+         "a new monitor run replaces the previous point log");
+  Expect(qp_lines.size() == 1,
+         "a new monitor run replaces the previous QP log");
+
+  std::remove(cycle_path.c_str());
+  std::remove(point_path.c_str());
+  std::remove(qp_path.c_str());
+  std::remove(directory.c_str());
 }
 
 void TestBaselinePlanner() {
@@ -1046,6 +1103,8 @@ int main() {
   RunTest(TestHighwayMapSplineContinuity, "TestHighwayMapSplineContinuity");
   RunTest(TestProtocolContract, "TestProtocolContract");
   RunTest(TestCartesianRuntimeMonitor, "TestCartesianRuntimeMonitor");
+  RunTest(TestRuntimeMonitorStartsWithCleanCsvLogs,
+          "TestRuntimeMonitorStartsWithCleanCsvLogs");
   RunTest(TestBaselinePlanner, "TestBaselinePlanner");
   RunTest(TestPlannerStartsWithHistory, "TestPlannerStartsWithHistory");
   RunTest(TestColdStartUsesHistoricalEndpointState,

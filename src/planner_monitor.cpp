@@ -191,22 +191,6 @@ bool EnsureDirectory(const std::string &path) {
   return CreateOneDirectory(path) && DirectoryExists(path);
 }
 
-bool FileIsEmpty(const std::string &path) {
-  struct stat information;
-  return stat(path.c_str(), &information) != 0 || information.st_size == 0;
-}
-
-bool FileContainsText(const std::string &path, const std::string &text) {
-  std::ifstream stream(path.c_str());
-  std::string line;
-  while (std::getline(stream, line)) {
-    if (line.find(text) != std::string::npos) {
-      return true;
-    }
-  }
-  return false;
-}
-
 std::string JoinPath(const std::string &directory,
                      const std::string &filename) {
   if (directory.empty()) {
@@ -575,16 +559,9 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
   const std::string point_path =
       JoinPath(config_.log_directory, "planner_points.csv");
   const std::string qp_path = JoinPath(config_.log_directory, "planner_qp.csv");
-  const bool cycle_empty = FileIsEmpty(cycle_path);
-  const bool point_empty = FileIsEmpty(point_path);
-  const bool qp_empty = FileIsEmpty(qp_path);
-  const bool cycle_schema_current =
-      FileContainsText(cycle_path, "lateral_rolling_replanned");
-  const bool point_schema_current =
-      FileContainsText(point_path, "lateral_progress_m");
-  cycle_csv_.open(cycle_path.c_str(), std::ios::out | std::ios::app);
-  point_csv_.open(point_path.c_str(), std::ios::out | std::ios::app);
-  qp_csv_.open(qp_path.c_str(), std::ios::out | std::ios::app);
+  cycle_csv_.open(cycle_path.c_str(), std::ios::out | std::ios::trunc);
+  point_csv_.open(point_path.c_str(), std::ios::out | std::ios::trunc);
+  qp_csv_.open(qp_path.c_str(), std::ios::out | std::ios::trunc);
   if (!cycle_csv_ || !point_csv_ || !qp_csv_) {
     cycle_csv_.close();
     point_csv_.close();
@@ -596,9 +573,8 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
   cycle_csv_ << std::setprecision(12);
   point_csv_ << std::setprecision(12);
   qp_csv_ << std::setprecision(12);
-  if (cycle_empty || !cycle_schema_current) {
-    cycle_csv_
-        << "session_id,cycle,previous_size,new_count,ego_speed_mps,"
+  cycle_csv_
+      << "session_id,cycle,previous_size,new_count,ego_speed_mps,"
            "initial_speed_mps,initial_acceleration_mps2,initial_jerk_mps3,"
            "plan_start_s,"
            "plan_start_d,lane_center_d,lateral_snap_m,history_state_aligned,"
@@ -619,21 +595,16 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
            "xy_tan_a_max,xy_tan_a_max_index,xy_a_max,xy_a_max_index,"
            "xy_abs_tan_j_max,xy_abs_tan_j_max_index,xy_j_max,xy_j_max_index,"
            "junction_speed_mps,junction_index,violation_mask\n";
-  }
-  if (point_empty || !point_schema_current) {
-    point_csv_
-        << "session_id,cycle,index,is_previous,x,y,vx_mps,vy_mps,speed_mps,"
+  point_csv_
+      << "session_id,cycle,index,is_previous,x,y,vx_mps,vy_mps,speed_mps,"
            "ax_mps2,ay_mps2,acceleration_mps2,tangential_acceleration_mps2,"
            "jerk_valid,jx_mps3,jy_mps3,jerk_mps3,tangential_jerk_mps3,"
            "planned_s,planned_v_mps,planned_a_mps2,planned_j_mps3,"
            "lateral_state_valid,lateral_transition_id,lateral_progress_m,"
            "road_parameter_s,planned_d\n";
-  }
-  if (qp_empty) {
-    qp_csv_ << "session_id,cycle,node,time_s,s,v_mps,a_mps2,j_mps3,"
-               "reference_v_mps,safety_margin_valid,min_safety_margin_m,"
-               "limiting_obstacle_id,emergency\n";
-  }
+  qp_csv_ << "session_id,cycle,node,time_s,s,v_mps,a_mps2,j_mps3,"
+             "reference_v_mps,safety_margin_valid,min_safety_margin_m,"
+             "limiting_obstacle_id,emergency\n";
   csv_available_ = true;
 }
 
