@@ -29,6 +29,7 @@
 *.gcno
 *.gcov
 coverage/
+/logs/
 
 # Editor and OS metadata
 .vscode/

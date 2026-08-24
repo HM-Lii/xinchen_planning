@@ -9,6 +9,13 @@ struct MapData {
   std::vector<double> s;
   std::vector<double> dx;
   std::vector<double> dy;
+  // Periodic cubic-spline second derivatives. LoadMap() populates these once
+  // so runtime road evaluation is O(log N). Hand-built maps may leave them
+  // empty; map evaluation will then build a temporary spline.
+  std::vector<double> spline_x_second;
+  std::vector<double> spline_y_second;
+  std::vector<double> spline_dx_second;
+  std::vector<double> spline_dy_second;
   double track_length = 0.0;
 };
 

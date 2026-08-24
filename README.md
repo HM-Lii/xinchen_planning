@@ -83,6 +83,9 @@ sudo chmod u+x {模拟器文件名}
 * Boost >= 1.66（需要Boost.System和Boost.Beast）
   * Ubuntu：运行`bash ./install-ubuntu.sh`
   * macOS：运行`bash ./install-mac.sh`
+* OSQP 1.x（需要提供CMake包和`osqp::osqp`目标）
+  * CMake配置阶段会检查OSQP依赖
+  * Eigen 3.3头文件已包含在仓库中，QP封装直接使用OSQP C接口
 
 ### 构建与运行
 
@@ -93,7 +96,7 @@ cd build
 ./path_planning
 ```
 
-程序会从构建目录中的`data/highway_map.csv`读取地图，并监听本机`4567`端口。随后启动模拟器即可连接规划程序。
+项目未显式指定其他配置时默认使用Release构建，因此只需要保留`build`目录。程序会从构建目录中的`data/highway_map.csv`读取地图，并监听本机`4567`端口。随后启动模拟器即可连接规划程序。
 
 ### 规划器接口契约
 
@@ -104,7 +107,11 @@ cd build
 * 尚未执行的`previous_path_x`和`previous_path_y`会原样保留
 * 缺少字段、字段类型错误、历史路径长度不一致或非有限数值会进入手动模式
 
-当前基线规划器保持主车所在车道，以不超过5 m/s²的纵向加速度逐渐接近49.5 mph。车辆预测、避碰和变道尚未实现，因此该基线仅用于验证通信、接口和轨迹连续性，不能作为最终安全规划器。
+### 当前规划器
+
+当前版本保持主车所在车道，通过纵向QP生成满足速度、acceleration、jerk和安全时距约束的轨迹，并使用周期道路样条与跨周期路径拼接保持Cartesian输出连续。运行时提供规划状态和Cartesian运动学双层监控。
+
+设计思路见[车道巡航原理](doc/lane_cruising_principles.md)，参数、数学模型、状态管理、异常处理及测试方法见[车道巡航实现细节](doc/lane_cruising_implementation.md)。
 
 ### 测试
 
