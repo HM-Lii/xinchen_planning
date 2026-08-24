@@ -23,6 +23,7 @@ struct PlannerConfig {
   double reference_min_acceleration_mps2 = -2.5;
   double reference_max_jerk_mps3 = 2.0;
   double time_headway_seconds = 1.5;
+  double gap_closing_time_seconds = 6.0;
   double standstill_gap_meters = 2.0;
   double ego_length_meters = 4.8;
   double obstacle_length_meters = 4.8;

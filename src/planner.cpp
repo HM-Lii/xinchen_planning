@@ -56,6 +56,7 @@ SpeedReferenceConfig MakeReferenceConfig(const PlannerConfig &config) {
   result.minimum_acceleration_mps2 = config.reference_min_acceleration_mps2;
   result.maximum_jerk_mps3 = config.reference_max_jerk_mps3;
   result.time_headway_seconds = config.time_headway_seconds;
+  result.gap_closing_time_seconds = config.gap_closing_time_seconds;
   result.standstill_gap_meters = config.standstill_gap_meters;
   result.ego_length_meters = config.ego_length_meters;
   result.obstacle_length_meters = config.obstacle_length_meters;
@@ -116,6 +117,8 @@ void ValidatePlannerConfig(const PlannerConfig &config) {
       config.reference_min_acceleration_mps2 < config.min_acceleration_mps2 ||
       config.reference_max_jerk_mps3 > config.max_jerk_mps3 ||
       config.time_headway_seconds < 0.0 || config.standstill_gap_meters < 0.0 ||
+      !std::isfinite(config.gap_closing_time_seconds) ||
+      config.gap_closing_time_seconds <= 0.0 ||
       config.ego_length_meters <= 0.0 || config.obstacle_length_meters <= 0.0 ||
       config.ego_width_meters <= 0.0 || config.obstacle_width_meters <= 0.0 ||
       config.prediction_margin_meters < 0.0 ||
@@ -296,8 +299,8 @@ PlannerOutput PathPlanner::Plan(const PlannerInput &input, const MapData &map) {
   const std::vector<PredictedObstacle> obstacles =
       PredictRelevantTraffic(input, plan_start_s, current_d, lane_center_d, map,
                              MakeTrafficConfig(config_));
-  const SpeedReferenceResult reference =
-      speed_reference_generator_.Generate(obstacles);
+  const SpeedReferenceResult reference = speed_reference_generator_.Generate(
+      obstacles, std::max(0.0, initial_state.v));
   const std::size_t reference_size = config_.qp_horizon_steps + 1;
 
   LongitudinalQpInput qp_input;

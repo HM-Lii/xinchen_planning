@@ -500,7 +500,8 @@ void TestAdjacentIntrusionSpeedLimits() {
   reference_config.time_step_seconds = 0.1;
   reference_config.maximum_speed_mps = prediction_config.maximum_speed_mps;
   const SpeedReferenceResult reference =
-      SpeedReferenceGenerator(reference_config).Generate(hard_predicted);
+      SpeedReferenceGenerator(reference_config)
+          .Generate(hard_predicted, reference_config.maximum_speed_mps);
   Expect(reference.success, "intrusion-aware speed reference QP should solve");
   Expect(reference.raw_speed_limits_mps.size() == 81,
          "intrusion-aware raw speed limit covers the horizon");
@@ -516,7 +517,8 @@ void TestAdjacentIntrusionSpeedLimits() {
   const std::vector<PredictedObstacle> slow_intrusion = PredictRelevantTraffic(
       slow_input, 100.0, 6.0, 6.0, map, prediction_config);
   const SpeedReferenceResult slow_intrusion_reference =
-      SpeedReferenceGenerator(reference_config).Generate(slow_intrusion);
+      SpeedReferenceGenerator(reference_config)
+          .Generate(slow_intrusion, reference_config.maximum_speed_mps);
   Expect(slow_intrusion_reference.raw_speed_limits_mps.size() == 81 &&
              std::fabs(slow_intrusion_reference.raw_speed_limits_mps.front() -
                        1.0) < 1e-9,
@@ -555,7 +557,7 @@ void TestMonotoneSpeedReference() {
   config.maximum_speed_mps = 20.0;
   SpeedReferenceGenerator generator(config);
 
-  const SpeedReferenceResult free_reference = generator.Generate({});
+  const SpeedReferenceResult free_reference = generator.Generate({}, 20.0);
   Expect(free_reference.success, "free-road reference QP should solve");
   if (free_reference.success) {
     ExpectNear(free_reference.trajectory.states.front().v, 20.0, 1e-5,
@@ -584,7 +586,7 @@ void TestMonotoneSpeedReference() {
   lower.speed_mps = 10.0;
   obstacles.push_back(lower);
 
-  const SpeedReferenceResult result = generator.Generate(obstacles);
+  const SpeedReferenceResult result = generator.Generate(obstacles, 20.0);
   Expect(result.success, "FOH speed reference QP should solve");
   Expect(result.events.size() == 2,
          "only record-low speed-limit events are retained");
@@ -618,6 +620,75 @@ void TestMonotoneSpeedReference() {
              "FOH reference ends with zero acceleration");
 }
 
+void TestGapClosingSpeedReference() {
+  SpeedReferenceConfig config;
+  config.horizon_steps = 80;
+  config.time_step_seconds = 0.1;
+  config.maximum_speed_mps = 20.0;
+  config.gap_closing_time_seconds = 6.0;
+  SpeedReferenceGenerator generator(config);
+
+  const double ego_speed_mps = 10.0;
+  const double lead_speed_mps = 10.0;
+  const double fixed_gap =
+      config.standstill_gap_meters + config.prediction_margin_meters +
+      0.5 * (config.ego_length_meters + config.obstacle_length_meters);
+  const double desired_gap =
+      fixed_gap + config.time_headway_seconds * ego_speed_mps;
+
+  PredictedObstacle lead;
+  lead.id = 11.0;
+  lead.relative_s = desired_gap + 12.0;
+  lead.speed_mps = lead_speed_mps;
+  lead.d = 6.0;
+  const SpeedReferenceResult surplus =
+      generator.Generate({lead}, ego_speed_mps);
+  Expect(surplus.success, "gap-closing speed reference should solve");
+  Expect(surplus.events.empty(),
+         "equal-speed following does not create a false conflict event");
+  if (surplus.raw_speed_limits_mps.size() == config.horizon_steps + 1) {
+    ExpectNear(surplus.raw_speed_limits_mps.front(), 12.0, 1e-9,
+               "distance surplus creates a gradual closing-speed allowance");
+    ExpectNear(surplus.raw_speed_limits_mps.back(), 12.0, 1e-9,
+               "gap-closing allowance is held over the reference horizon");
+  }
+
+  lead.relative_s = desired_gap;
+  const SpeedReferenceResult settled =
+      generator.Generate({lead}, ego_speed_mps);
+  Expect(settled.raw_speed_limits_mps.size() == config.horizon_steps + 1,
+         "settled following reference covers the horizon");
+  if (!settled.raw_speed_limits_mps.empty()) {
+    ExpectNear(settled.raw_speed_limits_mps.front(), lead_speed_mps, 1e-9,
+               "target following distance settles at the lead speed");
+  }
+
+  lead.relative_s =
+      desired_gap + config.gap_closing_time_seconds *
+                        (config.maximum_speed_mps - lead_speed_mps);
+  const SpeedReferenceResult far = generator.Generate({lead}, ego_speed_mps);
+  if (!far.raw_speed_limits_mps.empty()) {
+    ExpectNear(far.raw_speed_limits_mps.front(), config.maximum_speed_mps, 1e-9,
+               "large distance surplus releases the cruise limit");
+  }
+
+  PredictedObstacle closing = lead;
+  const double closing_ego_speed_mps = 15.0;
+  const double closing_desired_gap =
+      fixed_gap + config.time_headway_seconds * closing_ego_speed_mps;
+  closing.relative_s = closing_desired_gap + 25.0;
+  const SpeedReferenceResult conflict =
+      generator.Generate({closing}, closing_ego_speed_mps);
+  Expect(conflict.events.size() == 1,
+         "a faster ego vehicle creates one lead-vehicle conflict event");
+  if (conflict.events.size() == 1) {
+    ExpectNear(conflict.events.front().conflict_time_seconds, 5.0, 1e-9,
+               "conflict time uses distance surplus divided by closing speed");
+    ExpectNear(conflict.events.front().speed_limit_mps, lead_speed_mps, 1e-9,
+               "conflict event reaches the lead speed");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -632,6 +703,7 @@ int main() {
   TestTrafficCorridorAndCurvedRoadDistance();
   TestAdjacentIntrusionSpeedLimits();
   TestMonotoneSpeedReference();
+  TestGapClosingSpeedReference();
   if (failures != 0) {
     std::cerr << failures << " longitudinal test assertion(s) failed"
               << std::endl;

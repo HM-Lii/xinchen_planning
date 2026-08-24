@@ -9,8 +9,8 @@ public:
   explicit SpeedReferenceGenerator(
       const SpeedReferenceConfig &config = SpeedReferenceConfig());
 
-  SpeedReferenceResult
-  Generate(const std::vector<PredictedObstacle> &obstacles) const;
+  SpeedReferenceResult Generate(const std::vector<PredictedObstacle> &obstacles,
+                                double ego_speed_mps) const;
 
 private:
   SpeedReferenceConfig config_;

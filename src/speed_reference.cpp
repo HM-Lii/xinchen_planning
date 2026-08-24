@@ -32,6 +32,8 @@ void ValidateConfig(const SpeedReferenceConfig &config) {
       config.maximum_speed_mps <= 0.0 ||
       config.minimum_acceleration_mps2 >= 0.0 ||
       config.maximum_jerk_mps3 <= 0.0 || config.time_headway_seconds < 0.0 ||
+      !std::isfinite(config.gap_closing_time_seconds) ||
+      config.gap_closing_time_seconds <= 0.0 ||
       config.standstill_gap_meters < 0.0 || config.ego_length_meters <= 0.0 ||
       config.obstacle_length_meters <= 0.0 ||
       config.prediction_margin_meters < 0.0 || config.speed_weight <= 0.0 ||
@@ -90,11 +92,13 @@ void ValidateObstaclePrediction(const PredictedObstacle &obstacle,
 
 std::vector<SpeedLimitEvent>
 BuildEvents(const std::vector<PredictedObstacle> &obstacles,
-            const SpeedReferenceConfig &config) {
+            const SpeedReferenceConfig &config, double ego_speed_mps) {
   const std::size_t nodes = config.horizon_steps + 1;
   const double fixed_gap =
       config.standstill_gap_meters + config.prediction_margin_meters +
       0.5 * (config.ego_length_meters + config.obstacle_length_meters);
+  const double desired_following_distance =
+      fixed_gap + config.time_headway_seconds * ego_speed_mps;
   const double horizon =
       static_cast<double>(config.horizon_steps) * config.time_step_seconds;
   std::vector<SpeedLimitEvent> candidates;
@@ -104,15 +108,16 @@ BuildEvents(const std::vector<PredictedObstacle> &obstacles,
     if (first_hard_node == nodes) {
       continue;
     }
-    const double closing_speed = config.maximum_speed_mps - obstacle.speed_mps;
+    const double closing_speed = ego_speed_mps - obstacle.speed_mps;
     if (closing_speed <= 1e-6) {
       continue;
     }
     const double available_distance =
-        obstacle.relative_s - fixed_gap -
-        config.time_headway_seconds * config.maximum_speed_mps;
-    const double conflict_time =
-        std::max(0.0, available_distance / closing_speed);
+        obstacle.relative_s - desired_following_distance;
+    const double first_hard_time =
+        static_cast<double>(first_hard_node) * config.time_step_seconds;
+    const double conflict_time = std::max(
+        first_hard_time, std::max(0.0, available_distance / closing_speed));
     if (conflict_time > horizon + 1e-9) {
       continue;
     }
@@ -156,7 +161,11 @@ SpeedReferenceGenerator::SpeedReferenceGenerator(
 }
 
 SpeedReferenceResult SpeedReferenceGenerator::Generate(
-    const std::vector<PredictedObstacle> &obstacles) const {
+    const std::vector<PredictedObstacle> &obstacles,
+    double ego_speed_mps) const {
+  if (!std::isfinite(ego_speed_mps) || ego_speed_mps < 0.0) {
+    throw std::invalid_argument("invalid ego speed for speed reference");
+  }
   const std::size_t steps = config_.horizon_steps;
   const std::size_t nodes = steps + 1;
   const double dt = config_.time_step_seconds;
@@ -166,9 +175,26 @@ SpeedReferenceResult SpeedReferenceGenerator::Generate(
   const double infinity = std::numeric_limits<double>::infinity();
 
   SpeedReferenceResult result;
-  result.events = BuildEvents(obstacles, config_);
+  result.events = BuildEvents(obstacles, config_, ego_speed_mps);
   result.raw_speed_limits_mps.assign(nodes, config_.maximum_speed_mps);
+  const double fixed_gap =
+      config_.standstill_gap_meters + config_.prediction_margin_meters +
+      0.5 * (config_.ego_length_meters + config_.obstacle_length_meters);
+  const double desired_following_distance =
+      fixed_gap + config_.time_headway_seconds * ego_speed_mps;
   for (const PredictedObstacle &obstacle : obstacles) {
+    const std::size_t first_hard_node = FirstHardCollisionNode(obstacle, nodes);
+    if (first_hard_node != nodes) {
+      const double gap_surplus =
+          std::max(0.0, obstacle.relative_s - desired_following_distance);
+      const double gap_closing_speed_limit = std::min(
+          config_.maximum_speed_mps,
+          obstacle.speed_mps + gap_surplus / config_.gap_closing_time_seconds);
+      for (std::size_t k = first_hard_node; k < nodes; ++k) {
+        result.raw_speed_limits_mps[k] =
+            std::min(result.raw_speed_limits_mps[k], gap_closing_speed_limit);
+      }
+    }
     if (!obstacle.intrusion_speed_limit_mps.empty()) {
       for (std::size_t k = 0; k < nodes; ++k) {
         result.raw_speed_limits_mps[k] =

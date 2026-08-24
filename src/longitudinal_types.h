@@ -94,6 +94,9 @@ struct SpeedReferenceConfig {
   double minimum_acceleration_mps2 = -2.5;
   double maximum_jerk_mps3 = 2.0;
   double time_headway_seconds = 1.5;
+  // Converts positive following-distance surplus into a gradual closing-speed
+  // allowance above the lead vehicle speed.
+  double gap_closing_time_seconds = 6.0;
   double standstill_gap_meters = 5.0;
   double ego_length_meters = 4.8;
   double obstacle_length_meters = 4.8;
