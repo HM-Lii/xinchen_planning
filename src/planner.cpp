@@ -38,13 +38,13 @@ LongitudinalQpConfig MakeLongitudinalConfig(const PlannerConfig &config) {
   result.minimum_acceleration_mps2 = config.min_acceleration_mps2;
   result.maximum_acceleration_mps2 = config.max_acceleration_mps2;
   result.maximum_jerk_mps3 = config.max_jerk_mps3;
-  result.initial_jerk_continuity_weight =
-      config.initial_jerk_continuity_weight;
+  result.initial_jerk_continuity_weight = config.initial_jerk_continuity_weight;
   result.time_headway_seconds = config.time_headway_seconds;
   result.standstill_gap_meters = config.standstill_gap_meters;
   result.ego_length_meters = config.ego_length_meters;
   result.obstacle_length_meters = config.obstacle_length_meters;
   result.prediction_margin_meters = config.prediction_margin_meters;
+  result.headway_slack_weight = config.headway_slack_weight;
   return result;
 }
 
@@ -93,8 +93,10 @@ PlannerMonitorLimits MakeMonitorLimits(const PlannerConfig &config) {
   result.maximum_lateral_deviation_meters =
       0.5 * config.lane_width_meters - config.lane_boundary_margin_meters;
   result.time_headway_seconds = config.time_headway_seconds;
-  result.fixed_safety_gap_meters =
+  result.fixed_headway_gap_meters =
       config.standstill_gap_meters + config.prediction_margin_meters +
+      0.5 * (config.ego_length_meters + config.obstacle_length_meters);
+  result.collision_gap_meters =
       0.5 * (config.ego_length_meters + config.obstacle_length_meters);
   return result;
 }
@@ -115,6 +117,7 @@ void ValidatePlannerConfig(const PlannerConfig &config) {
       config.ego_length_meters <= 0.0 || config.obstacle_length_meters <= 0.0 ||
       config.ego_width_meters <= 0.0 || config.obstacle_width_meters <= 0.0 ||
       config.prediction_margin_meters < 0.0 ||
+      config.headway_slack_weight <= 0.0 ||
       config.traffic_lookahead_meters <= 0.0 ||
       config.lane_boundary_margin_meters < 0.0 ||
       config.lane_width_meters <= 0.0 || config.lane_count <= 0 ||
@@ -148,10 +151,9 @@ LongitudinalState ColdStartInitialState(const PlannerInput &input,
   // Normal replanning inherits exact saved states and never differentiates
   // quantized points.
   const double last_speed =
-      std::hypot(input.previous_path_x[size - 1] -
-                     input.previous_path_x[size - 2],
-                 input.previous_path_y[size - 1] -
-                     input.previous_path_y[size - 2]) /
+      std::hypot(
+          input.previous_path_x[size - 1] - input.previous_path_x[size - 2],
+          input.previous_path_y[size - 1] - input.previous_path_y[size - 2]) /
       config.time_step_seconds;
   if (std::isfinite(last_speed)) {
     state.v = std::max(0.0, last_speed);
@@ -160,10 +162,9 @@ LongitudinalState ColdStartInitialState(const PlannerInput &input,
     return state;
   }
   const double previous_speed =
-      std::hypot(input.previous_path_x[size - 2] -
-                     input.previous_path_x[size - 3],
-                 input.previous_path_y[size - 2] -
-                     input.previous_path_y[size - 3]) /
+      std::hypot(
+          input.previous_path_x[size - 2] - input.previous_path_x[size - 3],
+          input.previous_path_y[size - 2] - input.previous_path_y[size - 3]) /
       config.time_step_seconds;
   const double acceleration =
       (last_speed - previous_speed) / config.time_step_seconds;
@@ -184,8 +185,7 @@ bool HistoricalPlanAligned(const PlannerInput &input,
                            std::size_t output_points) {
   const std::size_t previous_size = input.previous_path_x.size();
   if (last_output_x.size() != output_points ||
-      last_output_y.size() != output_points ||
-      previous_size > output_points) {
+      last_output_y.size() != output_points || previous_size > output_points) {
     return false;
   }
   if (previous_size == 0) {
@@ -195,10 +195,9 @@ bool HistoricalPlanAligned(const PlannerInput &input,
   }
   const std::size_t consumed = output_points - previous_size;
   for (std::size_t index = 0; index < previous_size; ++index) {
-    if (std::hypot(input.previous_path_x[index] -
-                       last_output_x[consumed + index],
-                   input.previous_path_y[index] -
-                       last_output_y[consumed + index]) >
+    if (std::hypot(
+            input.previous_path_x[index] - last_output_x[consumed + index],
+            input.previous_path_y[index] - last_output_y[consumed + index]) >
         kHistoryAlignmentToleranceMeters) {
       return false;
     }
@@ -270,9 +269,9 @@ PlannerOutput PathPlanner::Plan(const PlannerInput &input, const MapData &map) {
   std::vector<LongitudinalState> retained_states;
   const bool historical_plan_aligned = HistoricalPlanAligned(
       input, last_output_x_, last_output_y_, config_.output_points);
-  LongitudinalState initial_state =
-      historical_plan_aligned ? TelemetryInitialState(input)
-                              : ColdStartInitialState(input, config_);
+  LongitudinalState initial_state = historical_plan_aligned
+                                        ? TelemetryInitialState(input)
+                                        : ColdStartInitialState(input, config_);
   if (historical_plan_aligned &&
       last_output_states_.size() == config_.output_points) {
     const std::size_t consumed = last_output_states_.size() - previous_size;
@@ -311,9 +310,9 @@ PlannerOutput PathPlanner::Plan(const PlannerInput &input, const MapData &map) {
   std::vector<double> solved_reference_speed_mps = qp_input.reference_speed_mps;
   LongitudinalQpResult solved = longitudinal_qp_.Solve(qp_input);
   if (!solved.success) {
-    // A hard safety boundary may already be impossible at the immutable end of
-    // the previous path. Generate the strongest feasible stop allowed by the
-    // same acceleration and jerk constraints.
+    // A hard body-collision boundary may already be impossible at the
+    // immutable end of the previous path. Generate the strongest feasible stop
+    // allowed by the same acceleration and jerk constraints.
     LongitudinalQpInput emergency_input = qp_input;
     emergency_input.reference_speed_mps.assign(reference_size, 0.0);
     emergency_input.obstacles.clear();
@@ -367,8 +366,9 @@ PlannerOutput PathPlanner::Plan(const PlannerInput &input, const MapData &map) {
   last_diagnostics_ = BuildPlannerDiagnostics(
       plan_cycle_, input, output, previous_size, initial_state, plan_start_s,
       current_d, lane_center_d, obstacles, solved_reference_speed_mps, solved,
-      last_output_states_, MakeMonitorLimits(config_), stitched_path.diagnostics,
-      stitched_path.output_states, historical_plan_aligned);
+      last_output_states_, MakeMonitorLimits(config_),
+      stitched_path.diagnostics, stitched_path.output_states,
+      historical_plan_aligned);
   runtime_monitor_.Record(last_diagnostics_);
   return output;
 }

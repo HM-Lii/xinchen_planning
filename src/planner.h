@@ -29,6 +29,7 @@ struct PlannerConfig {
   double ego_width_meters = 2.0;
   double obstacle_width_meters = 2.0;
   double prediction_margin_meters = 1.0;
+  double headway_slack_weight = 200.0;
   double traffic_lookahead_meters = 250.0;
   double lane_boundary_margin_meters = 0.35;
   double lane_width_meters = 4.0;

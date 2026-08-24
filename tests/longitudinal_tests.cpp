@@ -139,7 +139,7 @@ void TestInitialJerkContinuityReference() {
   CheckTrajectory(continued.trajectory, config);
 }
 
-void TestLongitudinalSafetyBoundary() {
+void TestLongitudinalHeadwayAndCollisionConstraints() {
   LongitudinalQpConfig config;
   config.horizon_steps = 80;
   config.maximum_speed_mps = 20.0;
@@ -160,26 +160,56 @@ void TestLongitudinalSafetyBoundary() {
     return;
   }
   CheckTrajectory(result.trajectory, config);
-  const double fixed_gap =
+  const double fixed_headway_gap =
       config.standstill_gap_meters + config.prediction_margin_meters +
+      0.5 * (config.ego_length_meters + config.obstacle_length_meters);
+  const double collision_gap =
       0.5 * (config.ego_length_meters + config.obstacle_length_meters);
   for (std::size_t k = 0; k < result.trajectory.states.size(); ++k) {
     const double time = static_cast<double>(k) * config.time_step_seconds;
     const LongitudinalState &state = result.trajectory.states[k];
-    const double safety_residual =
-        obstacle.relative_s + obstacle.speed_mps * time - fixed_gap - state.s -
-        config.time_headway_seconds * state.v;
-    Expect(safety_residual >= -1e-3,
-           "lead-vehicle time-headway boundary remains satisfied");
+    const double collision_residual = obstacle.relative_s +
+                                      obstacle.speed_mps * time -
+                                      collision_gap - state.s;
+    Expect(collision_residual >= -1e-3,
+           "lead-vehicle body-collision boundary remains satisfied");
   }
   Expect(result.trajectory.states.back().s < 155.0,
-         "hard safety boundary reduces free-road longitudinal progress");
+         "soft headway penalty reduces free-road longitudinal progress");
 
-  LongitudinalQpInput impossible = input;
-  impossible.obstacles[0].relative_s = 10.0;
-  const LongitudinalQpResult impossible_result = optimizer.Solve(impossible);
-  Expect(!impossible_result.success,
-         "an already violated immutable safety boundary is infeasible");
+  LongitudinalQpInput short_headway = input;
+  short_headway.obstacles[0].relative_s = 10.0;
+  short_headway.obstacles[0].speed_mps = 20.0;
+  const LongitudinalQpResult short_headway_result =
+      optimizer.Solve(short_headway);
+  Expect(short_headway_result.success,
+         "an initially short headway remains feasible through soft slack");
+  if (short_headway_result.success) {
+    CheckTrajectory(short_headway_result.trajectory, config);
+    const double initial_headway_margin =
+        short_headway.obstacles[0].relative_s - fixed_headway_gap -
+        config.time_headway_seconds * input.initial_speed_mps;
+    Expect(initial_headway_margin < -30.0,
+           "short-headway regression starts outside the desired gap");
+    Expect(short_headway_result.maximum_headway_slack_meters > 30.0,
+           "QP reports use of the headway slack variable");
+    for (std::size_t k = 0; k < short_headway_result.trajectory.states.size();
+         ++k) {
+      const double time = static_cast<double>(k) * config.time_step_seconds;
+      const double collision_residual =
+          short_headway.obstacles[0].relative_s +
+          short_headway.obstacles[0].speed_mps * time - collision_gap -
+          short_headway_result.trajectory.states[k].s;
+      Expect(collision_residual >= -1e-3,
+             "soft headway never relaxes the body-collision boundary");
+    }
+  }
+
+  LongitudinalQpInput overlapping = short_headway;
+  overlapping.obstacles[0].relative_s = 4.0;
+  const LongitudinalQpResult overlapping_result = optimizer.Solve(overlapping);
+  Expect(!overlapping_result.success,
+         "an immutable body overlap remains hard-infeasible");
 }
 
 void TestEmergencyStopObjective() {
@@ -305,8 +335,7 @@ void TestTrafficCorridorAndCurvedRoadDistance() {
   }
 
   const double raw_parameter_gap = 40.82;
-  const double physical_gap =
-      RoadArcLength(300.0, raw_parameter_gap, 6.0, map);
+  const double physical_gap = RoadArcLength(300.0, raw_parameter_gap, 6.0, map);
   ExpectNear(predicted.front().relative_s, physical_gap, 1e-9,
              "predicted obstacle distance is measured on the target lane");
   Expect(physical_gap + 1.0 < raw_parameter_gap,
@@ -319,8 +348,22 @@ void TestTrafficCorridorAndCurvedRoadDistance() {
   qp_input.reference_speed_mps.assign(qp_config.horizon_steps + 1, 20.0);
   qp_input.obstacles = predicted;
   const LongitudinalQpResult result = LongitudinalQp(qp_config).Solve(qp_input);
-  Expect(!result.success,
-         "physical gap below the configured headway is not accepted as safe");
+  Expect(result.success,
+         "physical gap below the desired headway remains QP-feasible");
+  if (result.success) {
+    Expect(result.maximum_headway_slack_meters > 0.9,
+           "curved-road headway deficit is represented by soft slack");
+    const double collision_gap =
+        0.5 * (qp_config.ego_length_meters + qp_config.obstacle_length_meters);
+    for (std::size_t k = 0; k < result.trajectory.states.size(); ++k) {
+      const double time = static_cast<double>(k) * qp_config.time_step_seconds;
+      const double collision_margin =
+          predicted.front().relative_s + predicted.front().speed_mps * time -
+          collision_gap - result.trajectory.states[k].s;
+      Expect(collision_margin >= -1e-3,
+             "curved-road body-collision boundary stays hard");
+    }
+  }
 }
 
 void TestMonotoneSpeedReference() {
@@ -400,7 +443,7 @@ int main() {
   TestLongitudinalAcceleration();
   TestLongitudinalDeceleration();
   TestInitialJerkContinuityReference();
-  TestLongitudinalSafetyBoundary();
+  TestLongitudinalHeadwayAndCollisionConstraints();
   TestEmergencyStopObjective();
   TestTrajectorySampler();
   TestTrafficPrediction();

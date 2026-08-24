@@ -10,22 +10,29 @@
 
 namespace {
 
-constexpr double kSafetyConstraintTighteningMeters = 0.02;
+constexpr double kObstacleConstraintTighteningMeters = 0.02;
 
 class VariableIndex {
 public:
-  explicit VariableIndex(std::size_t horizon_steps)
-      : steps_(horizon_steps), nodes_(horizon_steps + 1) {}
+  VariableIndex(std::size_t horizon_steps, std::size_t obstacle_count)
+      : steps_(horizon_steps), nodes_(horizon_steps + 1),
+        obstacle_count_(obstacle_count) {}
 
   int s(std::size_t k) const { return static_cast<int>(k); }
   int v(std::size_t k) const { return static_cast<int>(nodes_ + k); }
   int a(std::size_t k) const { return static_cast<int>(2 * nodes_ + k); }
   int j(std::size_t k) const { return static_cast<int>(3 * nodes_ + k); }
-  int size() const { return static_cast<int>(3 * nodes_ + steps_); }
+  int headway_slack(std::size_t obstacle, std::size_t k) const {
+    return static_cast<int>(3 * nodes_ + steps_ + obstacle * nodes_ + k);
+  }
+  int size() const {
+    return static_cast<int>(3 * nodes_ + steps_ + obstacle_count_ * nodes_);
+  }
 
 private:
   std::size_t steps_;
   std::size_t nodes_;
+  std::size_t obstacle_count_;
 };
 
 bool IsFiniteVector(const std::vector<double> &values) {
@@ -37,6 +44,13 @@ bool IsFiniteVector(const std::vector<double> &values) {
   return true;
 }
 
+bool HardCollisionActive(const PredictedObstacle &obstacle,
+                         std::size_t node, std::size_t nodes) {
+  return obstacle.hard_collision_active.empty() ||
+         (obstacle.hard_collision_active.size() == nodes &&
+          obstacle.hard_collision_active[node] != 0U);
+}
+
 void ValidateConfig(const LongitudinalQpConfig &config) {
   if (config.horizon_steps == 0 || config.time_step_seconds <= 0.0 ||
       config.maximum_speed_mps <= 0.0 ||
@@ -45,7 +59,8 @@ void ValidateConfig(const LongitudinalQpConfig &config) {
       config.maximum_jerk_mps3 <= 0.0 || config.time_headway_seconds < 0.0 ||
       config.standstill_gap_meters < 0.0 || config.ego_length_meters <= 0.0 ||
       config.obstacle_length_meters <= 0.0 ||
-      config.prediction_margin_meters < 0.0 || config.speed_weight <= 0.0 ||
+      config.prediction_margin_meters < 0.0 ||
+      config.headway_slack_weight <= 0.0 || config.speed_weight <= 0.0 ||
       config.acceleration_weight < 0.0 || config.jerk_weight < 0.0 ||
       config.initial_jerk_continuity_weight < 0.0 ||
       config.terminal_speed_weight < 0.0) {
@@ -73,20 +88,35 @@ LongitudinalQpResult LongitudinalQp::Solve(const LongitudinalQpInput &input) {
   }
   for (const PredictedObstacle &obstacle : input.obstacles) {
     if (!std::isfinite(obstacle.relative_s) ||
-        !std::isfinite(obstacle.speed_mps) || obstacle.relative_s < 0.0 ||
-        obstacle.speed_mps < 0.0) {
+        !std::isfinite(obstacle.speed_mps) ||
+        obstacle.relative_s < 0.0 || obstacle.speed_mps < 0.0 ||
+        (!obstacle.hard_collision_active.empty() &&
+         obstacle.hard_collision_active.size() != nodes) ||
+        (!obstacle.intrusion_speed_limit_mps.empty() &&
+         obstacle.intrusion_speed_limit_mps.size() != nodes) ||
+        !IsFiniteVector(obstacle.intrusion_speed_limit_mps)) {
       throw std::invalid_argument("invalid predicted obstacle");
     }
   }
 
-  const VariableIndex index(steps);
+  const VariableIndex index(steps, input.obstacles.size());
   const int variables = index.size();
   const int bound_rows = variables;
   const int dynamics_rows = static_cast<int>(3 * steps);
   const int progress_rows = static_cast<int>(steps);
-  const int safety_rows = static_cast<int>(input.obstacles.size() * nodes);
+  int active_obstacle_node_rows = 0;
+  for (const PredictedObstacle &obstacle : input.obstacles) {
+    for (std::size_t node = 0; node < nodes; ++node) {
+      if (HardCollisionActive(obstacle, node, nodes)) {
+        ++active_obstacle_node_rows;
+      }
+    }
+  }
+  const int collision_rows = active_obstacle_node_rows;
+  const int headway_rows = active_obstacle_node_rows;
   const int constraints_count =
-      bound_rows + dynamics_rows + progress_rows + safety_rows;
+      bound_rows + dynamics_rows + progress_rows + collision_rows +
+      headway_rows;
   const double infinity = std::numeric_limits<double>::infinity();
   const double dt = config_.time_step_seconds;
 
@@ -135,13 +165,22 @@ LongitudinalQpResult LongitudinalQp::Solve(const LongitudinalQpInput &input) {
           2.0 * continuity_weight * initial_jerk;
     }
   }
+  for (std::size_t obstacle = 0; obstacle < input.obstacles.size();
+       ++obstacle) {
+    for (std::size_t k = 0; k < nodes; ++k) {
+      hessian_triplets.emplace_back(index.headway_slack(obstacle, k),
+                                    index.headway_slack(obstacle, k),
+                                    2.0 * config_.headway_slack_weight);
+    }
+  }
   problem.hessian.resize(variables, variables);
   problem.hessian.setFromTriplets(hessian_triplets.begin(),
                                   hessian_triplets.end());
 
   std::vector<Eigen::Triplet<double>> constraint_triplets;
   constraint_triplets.reserve(
-      static_cast<std::size_t>(variables + 10 * steps + 2 * safety_rows));
+      static_cast<std::size_t>(variables + 14 * steps +
+                               4 * active_obstacle_node_rows));
 
   int row = 0;
   for (int variable = 0; variable < variables; ++variable, ++row) {
@@ -176,6 +215,12 @@ LongitudinalQpResult LongitudinalQp::Solve(const LongitudinalQpInput &input) {
     problem.lower_bound[index.j(k)] = -config_.maximum_jerk_mps3;
     problem.upper_bound[index.j(k)] = config_.maximum_jerk_mps3;
   }
+  for (std::size_t obstacle = 0; obstacle < input.obstacles.size();
+       ++obstacle) {
+    for (std::size_t k = 0; k < nodes; ++k) {
+      problem.lower_bound[index.headway_slack(obstacle, k)] = 0.0;
+    }
+  }
 
   for (std::size_t k = 0; k < steps; ++k) {
     constraint_triplets.emplace_back(row, index.a(k + 1), 1.0);
@@ -209,18 +254,44 @@ LongitudinalQpResult LongitudinalQp::Solve(const LongitudinalQpInput &input) {
     problem.lower_bound[row] = 0.0;
   }
 
-  const double fixed_gap =
-      config_.standstill_gap_meters + config_.prediction_margin_meters +
+  const double collision_gap =
       0.5 * (config_.ego_length_meters + config_.obstacle_length_meters);
+  const double fixed_headway_gap =
+      config_.standstill_gap_meters + config_.prediction_margin_meters +
+      collision_gap;
+  // Body overlap is never relaxed. The larger desired following gap is kept
+  // feasible through a separately penalized nonnegative slack variable.
   for (const PredictedObstacle &obstacle : input.obstacles) {
-    for (std::size_t k = 0; k < nodes; ++k, ++row) {
+    for (std::size_t k = 0; k < nodes; ++k) {
+      if (!HardCollisionActive(obstacle, k, nodes)) {
+        continue;
+      }
+      const double time = static_cast<double>(k) * dt;
+      constraint_triplets.emplace_back(row, index.s(k), 1.0);
+      problem.upper_bound[row] = obstacle.relative_s +
+                                 obstacle.speed_mps * time - collision_gap -
+                                 kObstacleConstraintTighteningMeters;
+      ++row;
+    }
+  }
+  for (std::size_t obstacle_index = 0;
+       obstacle_index < input.obstacles.size(); ++obstacle_index) {
+    const PredictedObstacle &obstacle = input.obstacles[obstacle_index];
+    for (std::size_t k = 0; k < nodes; ++k) {
+      if (!HardCollisionActive(obstacle, k, nodes)) {
+        continue;
+      }
       const double time = static_cast<double>(k) * dt;
       constraint_triplets.emplace_back(row, index.s(k), 1.0);
       constraint_triplets.emplace_back(row, index.v(k),
                                        config_.time_headway_seconds);
+      constraint_triplets.emplace_back(
+          row, index.headway_slack(obstacle_index, k), -1.0);
       problem.upper_bound[row] = obstacle.relative_s +
-                                 obstacle.speed_mps * time - fixed_gap -
-                                 kSafetyConstraintTighteningMeters;
+                                 obstacle.speed_mps * time -
+                                 fixed_headway_gap -
+                                 kObstacleConstraintTighteningMeters;
+      ++row;
     }
   }
   if (row != constraints_count) {
@@ -253,6 +324,14 @@ LongitudinalQpResult LongitudinalQp::Solve(const LongitudinalQpInput &input) {
     state.v = solved.primal[index.v(k)];
     state.a = solved.primal[index.a(k)];
     state.j = k < steps ? solved.primal[index.j(k)] : 0.0;
+  }
+  for (std::size_t obstacle = 0; obstacle < input.obstacles.size();
+       ++obstacle) {
+    for (std::size_t k = 0; k < nodes; ++k) {
+      result.maximum_headway_slack_meters =
+          std::max(result.maximum_headway_slack_meters,
+                   solved.primal[index.headway_slack(obstacle, k)]);
+    }
   }
   return result;
 }

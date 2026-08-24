@@ -56,9 +56,15 @@ struct QpNodeMonitorSample {
   double time_seconds = 0.0;
   LongitudinalState state;
   double reference_speed_mps = 0.0;
-  bool safety_margin_valid = false;
-  double minimum_safety_margin_meters = 0.0;
-  double limiting_obstacle_id = 0.0;
+  bool intrusion_speed_limit_valid = false;
+  double minimum_intrusion_speed_limit_mps = 0.0;
+  double intrusion_limiting_obstacle_id = 0.0;
+  bool headway_margin_valid = false;
+  double minimum_headway_margin_meters = 0.0;
+  double headway_limiting_obstacle_id = 0.0;
+  bool collision_margin_valid = false;
+  double minimum_collision_margin_meters = 0.0;
+  double collision_limiting_obstacle_id = 0.0;
 };
 
 struct PlannerMonitorLimits {
@@ -75,7 +81,8 @@ struct PlannerMonitorLimits {
   double safety_tolerance_meters = 0.05;
   double maximum_lateral_deviation_meters = 1.65;
   double time_headway_seconds = 0.0;
-  double fixed_safety_gap_meters = 0.0;
+  double fixed_headway_gap_meters = 0.0;
+  double collision_gap_meters = 0.0;
 };
 
 struct PlannerCycleDiagnostics {
@@ -99,6 +106,7 @@ struct PlannerCycleDiagnostics {
   double reference_last_mps = 0.0;
   std::string qp_status;
   double qp_objective = 0.0;
+  double qp_maximum_headway_slack_meters = 0.0;
   bool emergency = false;
 
   IndexedMetric qp_minimum_speed;
@@ -106,8 +114,12 @@ struct PlannerCycleDiagnostics {
   IndexedMetric qp_minimum_acceleration;
   IndexedMetric qp_maximum_acceleration;
   IndexedMetric qp_maximum_absolute_jerk;
-  IndexedMetric qp_minimum_safety_margin;
-  double qp_limiting_obstacle_id = 0.0;
+  IndexedMetric minimum_intrusion_speed_limit;
+  double intrusion_limiting_obstacle_id = 0.0;
+  IndexedMetric qp_minimum_headway_margin;
+  double qp_headway_limiting_obstacle_id = 0.0;
+  IndexedMetric qp_minimum_collision_margin;
+  double qp_collision_limiting_obstacle_id = 0.0;
 
   IndexedMetric cartesian_maximum_speed;
   IndexedMetric cartesian_minimum_tangential_acceleration;
@@ -122,7 +134,7 @@ struct PlannerCycleDiagnostics {
   bool qp_speed_violation = false;
   bool qp_acceleration_violation = false;
   bool qp_jerk_violation = false;
-  bool qp_safety_violation = false;
+  bool qp_collision_violation = false;
   bool cartesian_speed_violation = false;
   bool cartesian_acceleration_violation = false;
   bool cartesian_jerk_violation = false;

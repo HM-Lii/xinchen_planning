@@ -17,6 +17,14 @@ struct PredictedObstacle {
   double relative_s = 0.0;
   double speed_mps = 0.0;
   double d = 0.0;
+  // Empty keeps the legacy meaning: the obstacle is collision-relevant at
+  // every QP node. Traffic prediction fills one entry per node from the
+  // vehicle's current contour; lateral occupancy is not extrapolated.
+  std::vector<unsigned char> hard_collision_active;
+  // Per-node speed cap caused only by a currently intruding adjacent-vehicle
+  // contour. The current-frame cap is held constant over the planning horizon;
+  // empty means that this obstacle contributes no intrusion speed cap.
+  std::vector<double> intrusion_speed_limit_mps;
 };
 
 struct SpeedLimitEvent {
@@ -42,6 +50,7 @@ struct LongitudinalQpConfig {
   double ego_length_meters = 4.8;
   double obstacle_length_meters = 4.8;
   double prediction_margin_meters = 1.0;
+  double headway_slack_weight = 200.0;
   double speed_weight = 8.0;
   double acceleration_weight = 0.4;
   double jerk_weight = 0.08;
@@ -63,6 +72,7 @@ struct LongitudinalQpResult {
   bool success = false;
   std::string status;
   double objective = 0.0;
+  double maximum_headway_slack_meters = 0.0;
   LongitudinalTrajectory trajectory;
 };
 
