@@ -442,6 +442,18 @@ PlannerCycleDiagnostics BuildPlannerDiagnostics(
   const bool exact_history_available =
       historical_plan_aligned && lateral.state_aligned &&
       output_lateral_states.size() == output.next_x.size();
+  double history_anchor_offset_x = 0.0;
+  double history_anchor_offset_y = 0.0;
+  if (exact_history_available && previous_path_size != 0) {
+    const LateralPathState &anchor =
+        output_lateral_states[previous_path_size - 1];
+    if (anchor.valid) {
+      history_anchor_offset_x =
+          output.next_x[previous_path_size - 1] - anchor.expected_x;
+      history_anchor_offset_y =
+          output.next_y[previous_path_size - 1] - anchor.expected_y;
+    }
+  }
   if (exact_history_available) {
     for (std::size_t index = 0; index < previous_path_size; ++index) {
       const LateralPathState &state = output_lateral_states[index];
@@ -452,8 +464,14 @@ PlannerCycleDiagnostics BuildPlannerDiagnostics(
                     std::hypot(output.next_x[index] - state.expected_x,
                                output.next_y[index] - state.expected_y),
                     index);
-      evaluation_output.next_x[index] = state.expected_x;
-      evaluation_output.next_y[index] = state.expected_y;
+      // Preserve the exact historical shape but translate it into the same
+      // endpoint frame used by the residual-corrected new path. This removes
+      // simulator coordinate quantization without creating an artificial
+      // position step at the old/new path boundary.
+      evaluation_output.next_x[index] =
+          state.expected_x + history_anchor_offset_x;
+      evaluation_output.next_y[index] =
+          state.expected_y + history_anchor_offset_y;
     }
   }
   const std::vector<CartesianKinematicSample> evaluation_samples =

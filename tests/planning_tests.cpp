@@ -346,6 +346,72 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
   std::remove(directory.c_str());
 }
 
+void TestCartesianMonitorUsesAlignedStitchingFrame() {
+  PlannerInput input;
+  input.ego.x = 0.001;
+  input.ego.y = 0.0;
+  input.ego.yaw_deg = 0.0;
+  input.ego.speed_mph = 10.0 / 0.44704;
+
+  PlannerOutput output;
+  output.next_x = {0.201, 0.401, 0.601, 0.801,
+                   1.001, 1.201, 1.401};
+  output.next_y.assign(output.next_x.size(), 0.0);
+  input.previous_path_x.assign(output.next_x.begin(),
+                               output.next_x.begin() + 4);
+  input.previous_path_y.assign(4, 0.0);
+
+  LongitudinalQpResult qp_result;
+  qp_result.success = true;
+  qp_result.status = "solved";
+  qp_result.trajectory.time_step_seconds = 0.1;
+  qp_result.trajectory.states.resize(2);
+  qp_result.trajectory.states[0].v = 10.0;
+  qp_result.trajectory.states[1].s = 1.0;
+  qp_result.trajectory.states[1].v = 10.0;
+
+  std::vector<LongitudinalState> output_states(output.next_x.size());
+  for (LongitudinalState &state : output_states) {
+    state.v = 10.0;
+  }
+  std::vector<LateralPathState> lateral_states(output.next_x.size());
+  for (std::size_t index = 0; index < lateral_states.size(); ++index) {
+    lateral_states[index].valid = true;
+    lateral_states[index].expected_x =
+        index < 4 ? 0.2 * static_cast<double>(index + 1)
+                  : output.next_x[index];
+  }
+  LateralStitchDiagnostics lateral;
+  lateral.state_aligned = true;
+
+  PlannerMonitorLimits limits;
+  limits.output_time_step_seconds = 0.02;
+  limits.maximum_speed_mps = 22.0;
+  limits.minimum_acceleration_mps2 = -5.0;
+  limits.maximum_acceleration_mps2 = 3.0;
+  limits.maximum_jerk_mps3 = 8.0;
+  limits.maximum_cartesian_acceleration_mps2 = 10.0;
+  limits.maximum_cartesian_jerk_mps3 = 10.0;
+
+  const PlannerCycleDiagnostics diagnostics = BuildPlannerDiagnostics(
+      9, input, output, 4, qp_result.trajectory.states[0], 0.0, 6.0, 6.0,
+      {}, {10.0, 10.0}, qp_result, output_states, limits, lateral,
+      lateral_states, true);
+  Expect(diagnostics.historical_path_position_residual.valid,
+         "monitor retains the raw history quantization residual");
+  ExpectNear(diagnostics.historical_path_position_residual.value, 0.001,
+             1e-12, "monitor measures the history endpoint offset");
+  Expect(diagnostics.cartesian_maximum_acceleration.valid &&
+             diagnostics.cartesian_maximum_acceleration.value < 1e-6,
+         "a shared stitching frame removes false Cartesian acceleration");
+  Expect(diagnostics.cartesian_maximum_jerk.valid &&
+             diagnostics.cartesian_maximum_jerk.value < 1e-5,
+         "a shared stitching frame removes false Cartesian jerk");
+  Expect(!diagnostics.cartesian_acceleration_violation &&
+             !diagnostics.cartesian_jerk_violation,
+         "history quantization alone does not trigger a violation");
+}
+
 void TestBaselinePlanner() {
   const MapData map = SquareMap();
   const SimulatorMessage parsed =
@@ -1105,6 +1171,8 @@ int main() {
   RunTest(TestCartesianRuntimeMonitor, "TestCartesianRuntimeMonitor");
   RunTest(TestRuntimeMonitorStartsWithCleanCsvLogs,
           "TestRuntimeMonitorStartsWithCleanCsvLogs");
+  RunTest(TestCartesianMonitorUsesAlignedStitchingFrame,
+          "TestCartesianMonitorUsesAlignedStitchingFrame");
   RunTest(TestBaselinePlanner, "TestBaselinePlanner");
   RunTest(TestPlannerStartsWithHistory, "TestPlannerStartsWithHistory");
   RunTest(TestColdStartUsesHistoricalEndpointState,
