@@ -68,6 +68,8 @@ TrafficPredictionConfig MakeTrafficConfig(const PlannerConfig &config) {
   result.simulator_time_step_seconds = config.time_step_seconds;
   result.lane_width_meters = config.lane_width_meters;
   result.lane_boundary_margin_meters = config.lane_boundary_margin_meters;
+  result.ego_width_meters = config.ego_width_meters;
+  result.obstacle_width_meters = config.obstacle_width_meters;
   result.lookahead_distance_meters = config.traffic_lookahead_meters;
   return result;
 }
@@ -111,6 +113,7 @@ void ValidatePlannerConfig(const PlannerConfig &config) {
       config.reference_max_jerk_mps3 > config.max_jerk_mps3 ||
       config.time_headway_seconds < 0.0 || config.standstill_gap_meters < 0.0 ||
       config.ego_length_meters <= 0.0 || config.obstacle_length_meters <= 0.0 ||
+      config.ego_width_meters <= 0.0 || config.obstacle_width_meters <= 0.0 ||
       config.prediction_margin_meters < 0.0 ||
       config.traffic_lookahead_meters <= 0.0 ||
       config.lane_boundary_margin_meters < 0.0 ||
@@ -134,20 +137,28 @@ LongitudinalState ColdStartInitialState(const PlannerInput &input,
                                         const PlannerConfig &config) {
   LongitudinalState state = TelemetryInitialState(input);
   const std::size_t size = input.previous_path_x.size();
-  if (size < 3) {
+  if (size < 2) {
     return state;
   }
 
   // This branch is used only when no matching locally planned state queue
   // exists (for example, process startup with an external previous_path).
-  // Recover a bounded endpoint acceleration once; normal replanning always
-  // inherits the exact saved state and never differentiates quantized points.
+  // The QP starts at the historical endpoint, so recover that endpoint's speed
+  // even when it legitimately differs from the current-time telemetry speed.
+  // Normal replanning inherits exact saved states and never differentiates
+  // quantized points.
   const double last_speed =
       std::hypot(input.previous_path_x[size - 1] -
                      input.previous_path_x[size - 2],
                  input.previous_path_y[size - 1] -
                      input.previous_path_y[size - 2]) /
       config.time_step_seconds;
+  if (std::isfinite(last_speed)) {
+    state.v = std::max(0.0, last_speed);
+  }
+  if (size < 3) {
+    return state;
+  }
   const double previous_speed =
       std::hypot(input.previous_path_x[size - 2] -
                      input.previous_path_x[size - 3],
@@ -159,8 +170,7 @@ LongitudinalState ColdStartInitialState(const PlannerInput &input,
   const double maximum_abs_acceleration =
       std::max(std::fabs(config.min_acceleration_mps2),
                std::fabs(config.max_acceleration_mps2));
-  if (std::isfinite(last_speed) && std::isfinite(acceleration) &&
-      std::fabs(last_speed - state.v) <= 0.5 &&
+  if (std::isfinite(acceleration) &&
       std::fabs(acceleration) <= maximum_abs_acceleration + 0.5) {
     state.a = std::max(config.min_acceleration_mps2,
                        std::min(acceleration, config.max_acceleration_mps2));
@@ -283,8 +293,8 @@ PlannerOutput PathPlanner::Plan(const PlannerInput &input, const MapData &map) {
   }
 
   const std::vector<PredictedObstacle> obstacles =
-      PredictRelevantTraffic(input, plan_start_s, lane_center_d,
-                             map.track_length, MakeTrafficConfig(config_));
+      PredictRelevantTraffic(input, plan_start_s, current_d, lane_center_d, map,
+                             MakeTrafficConfig(config_));
   const SpeedReferenceResult reference =
       speed_reference_generator_.Generate(obstacles);
   const std::size_t reference_size = config_.qp_horizon_steps + 1;
@@ -327,7 +337,8 @@ PlannerOutput PathPlanner::Plan(const PlannerInput &input, const MapData &map) {
   output.next_x.reserve(config_.output_points);
   output.next_y.reserve(config_.output_points);
   const StitchedRoadPathResult stitched_path = path_stitcher_.Sample(
-      input, plan_start_s, lane_center_d, new_states, map);
+      input, plan_start_s, lane_center_d, new_states,
+      std::max(TargetSpeedMps(config_), initial_state.v), map);
   for (const std::pair<double, double> &xy : stitched_path.new_points) {
     output.next_x.push_back(xy.first);
     output.next_y.push_back(xy.second);

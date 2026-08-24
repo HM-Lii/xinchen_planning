@@ -11,10 +11,8 @@ namespace {
 constexpr double kDegreesToRadians = 3.14159265358979323846 / 180.0;
 constexpr double kMilesPerHourToMetersPerSecond = 0.44704;
 constexpr double kMinimumTangentLength = 1e-8;
-constexpr double kArcLengthIntegrationStepMeters = 0.2;
 constexpr double kArcLengthTableStepMeters = 0.025;
 constexpr double kMinimumTransitionLengthMeters = 15.0;
-constexpr double kMaximumTransitionLengthMeters = 60.0;
 constexpr double kCorrectionJerkBudgetMps3 = 8.0;
 constexpr double kPositionJerkShapeBound = 100.0;
 constexpr double kTangentJerkShapeBound = 40.0;
@@ -94,64 +92,6 @@ Vector2d LimitMagnitude(const Vector2d &vector, double maximum_magnitude) {
     return vector;
   }
   return Scale(vector, maximum_magnitude / magnitude);
-}
-
-double RoadDerivativeMagnitude(double road_s, double lane_d,
-                               const MapData &map) {
-  const RoadGeometrySample geometry = EvaluateRoadGeometry(road_s, lane_d, map);
-  const double magnitude =
-      std::hypot(geometry.first_derivative_x, geometry.first_derivative_y);
-  if (!std::isfinite(magnitude) || magnitude <= kMinimumTangentLength) {
-    throw std::runtime_error("road spline has a degenerate tangent");
-  }
-  return magnitude;
-}
-
-double RoadArcLength(double start_s, double parameter_distance, double lane_d,
-                     const MapData &map) {
-  if (parameter_distance <= 0.0) {
-    return 0.0;
-  }
-  std::size_t intervals = static_cast<std::size_t>(
-      std::ceil(parameter_distance / kArcLengthIntegrationStepMeters));
-  intervals = std::max<std::size_t>(2, intervals);
-  if (intervals % 2 != 0) {
-    ++intervals;
-  }
-  const double step = parameter_distance / static_cast<double>(intervals);
-  double weighted_sum =
-      RoadDerivativeMagnitude(start_s, lane_d, map) +
-      RoadDerivativeMagnitude(start_s + parameter_distance, lane_d, map);
-  for (std::size_t index = 1; index < intervals; ++index) {
-    const double weight = index % 2 == 0 ? 2.0 : 4.0;
-    weighted_sum +=
-        weight * RoadDerivativeMagnitude(
-                     start_s + static_cast<double>(index) * step, lane_d, map);
-  }
-  return weighted_sum * step / 3.0;
-}
-
-double AdvanceRoadParameter(double start_s, double distance_meters,
-                            double lane_d, const MapData &map) {
-  if (distance_meters <= 1e-12) {
-    return start_s;
-  }
-  double parameter_distance =
-      distance_meters / RoadDerivativeMagnitude(start_s, lane_d, map);
-  parameter_distance = std::max(parameter_distance, 1e-9);
-  for (int iteration = 0; iteration < 6; ++iteration) {
-    const double measured_distance =
-        RoadArcLength(start_s, parameter_distance, lane_d, map);
-    const double error = measured_distance - distance_meters;
-    if (std::fabs(error) <= 1e-9) {
-      break;
-    }
-    const double end_speed =
-        RoadDerivativeMagnitude(start_s + parameter_distance, lane_d, map);
-    parameter_distance -= error / end_speed;
-    parameter_distance = std::max(parameter_distance, 1e-9);
-  }
-  return start_s + parameter_distance;
 }
 
 Vector2d HistoricalAnchor(const PlannerInput &input) {
@@ -259,9 +199,11 @@ Vector2d HistoricalCurvature(const PlannerInput &input,
 }
 
 double MaximumPlanningSpeed(const PlannerInput &input,
-                            const std::vector<LongitudinalState> &states) {
-  double maximum_speed =
-      std::max(0.0, input.ego.speed_mph * kMilesPerHourToMetersPerSecond);
+                            const std::vector<LongitudinalState> &states,
+                            double configured_maximum_speed) {
+  double maximum_speed = std::max(
+      configured_maximum_speed,
+      std::max(0.0, input.ego.speed_mph * kMilesPerHourToMetersPerSecond));
   for (const LongitudinalState &state : states) {
     maximum_speed = std::max(maximum_speed, std::max(0.0, state.v));
   }
@@ -286,11 +228,9 @@ double CorrectionTransitionLength(double maximum_speed, double lateral_error,
       maximum_speed *
       std::cbrt(kLateralJerkShapeBound * std::fabs(lateral_error) /
                 kCorrectionJerkBudgetMps3);
-  return std::min(
-      kMaximumTransitionLengthMeters,
-      std::max(kMinimumTransitionLengthMeters,
-               std::max(std::max(position_length, tangent_length),
-                        std::max(curvature_length, lateral_length))));
+  return std::max(kMinimumTransitionLengthMeters,
+                  std::max(std::max(position_length, tangent_length),
+                           std::max(curvature_length, lateral_length)));
 }
 
 double SmoothStep5(double u) {
@@ -534,7 +474,7 @@ CurveSample EvaluateCurve(const LateralCorrectionPlan &plan, double progress,
   const double d_derivative = PlannedDDerivative(plan, progress);
   const RoadGeometrySample road = EvaluateRoadGeometry(road_parameter, d, map);
   const double road_parameter_derivative =
-      1.0 / RoadDerivativeMagnitude(road_parameter, plan.target_d, map);
+      1.0 / RoadParameterMetric(road_parameter, plan.target_d, map);
   const Vector2d normal = RoadNormal(road_parameter, map);
   const BoundaryError boundary_error = BoundaryFromPlan(plan);
 
@@ -698,7 +638,7 @@ LateralCorrectionPlan InitializePlan(
   const Vector2d road_tangent =
       UnitVector({road.first_derivative_x, road.first_derivative_y}, {1.0, 0.0});
   const double road_parameter_derivative =
-      1.0 / RoadDerivativeMagnitude(plan_start_s, target_d, map);
+      1.0 / RoadParameterMetric(plan_start_s, target_d, map);
   const Vector2d base_derivative = {
       road.first_derivative_x * road_parameter_derivative,
       road.first_derivative_y * road_parameter_derivative};
@@ -737,8 +677,11 @@ LateralCorrectionPlan InitializePlan(
 
 void ValidateInput(const PlannerInput &input, double plan_start_s,
                    double lane_d,
-                   const std::vector<LongitudinalState> &states) {
+                   const std::vector<LongitudinalState> &states,
+                   double maximum_planning_speed_mps) {
   if (!std::isfinite(plan_start_s) || !std::isfinite(lane_d) ||
+      !std::isfinite(maximum_planning_speed_mps) ||
+      maximum_planning_speed_mps < 0.0 ||
       input.previous_path_x.size() != input.previous_path_y.size()) {
     throw std::invalid_argument("invalid stitched-path input");
   }
@@ -757,8 +700,10 @@ void ValidateInput(const PlannerInput &input, double plan_start_s,
 
 StitchedRoadPathResult PathStitcher::Sample(
     const PlannerInput &input, double plan_start_s, double lane_d,
-    const std::vector<LongitudinalState> &states, const MapData &map) {
-  ValidateInput(input, plan_start_s, lane_d, states);
+    const std::vector<LongitudinalState> &states,
+    double maximum_planning_speed_mps, const MapData &map) {
+  ValidateInput(input, plan_start_s, lane_d, states,
+                maximum_planning_speed_mps);
 
   const std::size_t previous_size = input.previous_path_x.size();
   const std::size_t output_point_count = previous_size + states.size();
@@ -793,7 +738,8 @@ StitchedRoadPathResult PathStitcher::Sample(
   std::uint64_t next_transition_id = next_transition_id_;
   bool reset = false;
   bool rolling_replanned = false;
-  const double maximum_speed = MaximumPlanningSpeed(input, states);
+  const double maximum_speed =
+      MaximumPlanningSpeed(input, states, maximum_planning_speed_mps);
   const double current_d =
       previous_size == 0 ? input.ego.d : input.end_path_d;
   double start_progress = 0.0;

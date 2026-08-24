@@ -26,6 +26,8 @@ struct PlannerConfig {
   double standstill_gap_meters = 5.0;
   double ego_length_meters = 4.8;
   double obstacle_length_meters = 4.8;
+  double ego_width_meters = 2.0;
+  double obstacle_width_meters = 2.0;
   double prediction_margin_meters = 1.0;
   double traffic_lookahead_meters = 250.0;
   double lane_boundary_margin_meters = 0.35;

@@ -67,7 +67,8 @@ class PathStitcher {
 public:
   StitchedRoadPathResult Sample(
       const PlannerInput &input, double plan_start_s, double lane_d,
-      const std::vector<LongitudinalState> &states, const MapData &map);
+      const std::vector<LongitudinalState> &states,
+      double maximum_planning_speed_mps, const MapData &map);
 
 private:
   LateralCorrectionPlan plan_;

@@ -9,6 +9,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 find_package(Boost 1.66 REQUIRED COMPONENTS system)
+set(CMAKE_PREFIX_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/.deps/osqp;${CMAKE_PREFIX_PATH}"
+)
 find_package(osqp REQUIRED)
 find_package(Threads REQUIRED)
 

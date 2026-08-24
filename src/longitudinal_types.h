@@ -70,6 +70,8 @@ struct TrafficPredictionConfig {
   double simulator_time_step_seconds = 0.02;
   double lane_width_meters = 4.0;
   double lane_boundary_margin_meters = 0.35;
+  double ego_width_meters = 2.0;
+  double obstacle_width_meters = 2.0;
   double lookahead_distance_meters = 250.0;
 };
 

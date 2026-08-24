@@ -10,7 +10,8 @@ double ForwardTrackDistance(double from_s, double to_s, double track_length);
 
 std::vector<PredictedObstacle>
 PredictRelevantTraffic(const PlannerInput &input, double plan_start_s,
-                       double lane_center_d, double track_length,
+                       double plan_start_d, double lane_center_d,
+                       const MapData &map,
                        const TrafficPredictionConfig &config);
 
 #endif // TRAFFIC_PREDICTOR_H

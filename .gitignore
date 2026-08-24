@@ -30,6 +30,7 @@
 *.gcov
 coverage/
 /logs/
+/.deps/
 
 # Editor and OS metadata
 .vscode/

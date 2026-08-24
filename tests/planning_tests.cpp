@@ -356,6 +356,58 @@ void TestPlannerStartsWithHistory() {
              "fresh-planner history y remains unchanged");
 }
 
+void TestColdStartUsesHistoricalEndpointState() {
+  const MapData map = LoadMap("data/highway_map.csv");
+  constexpr double time_step = 0.02;
+  constexpr double lane_d = 6.0;
+
+  PlannerInput input;
+  input.ego.s = 100.0;
+  input.ego.d = lane_d;
+  input.ego.speed_mph = 10.0 / 0.44704;
+  const RoadGeometrySample ego_geometry =
+      EvaluateRoadGeometry(input.ego.s, lane_d, map);
+  input.ego.x = ego_geometry.x;
+  input.ego.y = ego_geometry.y;
+  input.ego.yaw_deg =
+      std::atan2(ego_geometry.first_derivative_y,
+                 ego_geometry.first_derivative_x) *
+      180.0 / 3.14159265358979323846;
+
+  double road_s = input.ego.s;
+  for (std::size_t index = 0; index < 40; ++index) {
+    const double speed =
+        10.0 + 2.0 * static_cast<double>(index + 1) / 40.0;
+    road_s = AdvanceRoadParameter(road_s, speed * time_step, lane_d, map);
+    const RoadGeometrySample point = EvaluateRoadGeometry(road_s, lane_d, map);
+    input.previous_path_x.push_back(point.x);
+    input.previous_path_y.push_back(point.y);
+  }
+  input.end_path_s = road_s;
+  input.end_path_d = lane_d;
+
+  PathPlanner planner;
+  const PlannerOutput output = planner.Plan(input, map);
+  const PlannerCycleDiagnostics &diagnostics = planner.last_diagnostics();
+  const std::size_t junction = input.previous_path_x.size();
+  const double incoming_speed =
+      std::hypot(output.next_x[junction - 1] - output.next_x[junction - 2],
+                 output.next_y[junction - 1] - output.next_y[junction - 2]) /
+      time_step;
+  const double junction_speed =
+      std::hypot(output.next_x[junction] - output.next_x[junction - 1],
+                 output.next_y[junction] - output.next_y[junction - 1]) /
+      time_step;
+
+  Expect(std::fabs(diagnostics.initial_speed_mps - incoming_speed) < 0.1,
+         "cold start uses the historical endpoint speed");
+  Expect(std::fabs(junction_speed - incoming_speed) < 0.15,
+         "cold-start trajectory is speed-continuous at the history junction");
+  Expect(std::fabs(diagnostics.cartesian_samples[junction]
+                       .tangential_acceleration_mps2) < 5.0,
+         "cold-start junction acceleration remains within the planner bound");
+}
+
 void TestPlannerStitchesFromHistoricalEndpoint() {
   const MapData map = LoadMap("data/highway_map.csv");
   const double start_s = 205.2936;
@@ -652,6 +704,78 @@ void TestRepeatedReplanningReturnsToLockedLane() {
              std::to_string(maximum_jerk));
 }
 
+void TestLowSpeedLaneReturnUsesFutureSpeedBound() {
+  const MapData map = LoadMap("data/highway_map.csv");
+  constexpr double lane_center_d = 6.0;
+  constexpr std::size_t consumed_points = 4;
+
+  PlannerInput input;
+  input.ego.s = 100.0;
+  input.ego.d = 4.4;
+  input.end_path_s = input.ego.s;
+  input.end_path_d = input.ego.d;
+  const RoadGeometrySample initial_geometry =
+      EvaluateRoadGeometry(input.ego.s, input.ego.d, map);
+  input.ego.x = initial_geometry.x;
+  input.ego.y = initial_geometry.y;
+  input.ego.yaw_deg =
+      std::atan2(initial_geometry.first_derivative_y,
+                 initial_geometry.first_derivative_x) *
+      180.0 / 3.14159265358979323846;
+  input.ego.speed_mph = 0.0;
+
+  PathPlanner planner;
+  double maximum_jerk = 0.0;
+  double transition_length = 0.0;
+  for (int cycle = 0; cycle < 100; ++cycle) {
+    const PlannerOutput output = planner.Plan(input, map);
+    const PlannerCycleDiagnostics &diagnostics = planner.last_diagnostics();
+    if (cycle == 0) {
+      transition_length = diagnostics.lateral.transition_length_m;
+      ExpectNear(diagnostics.lane_center_d, lane_center_d, 1e-12,
+                 "low-speed return keeps the selected middle lane");
+      Expect(!diagnostics.lane_deviation_violation,
+             "lane-return regression starts inside the allowed lane envelope");
+    }
+    if (diagnostics.cartesian_maximum_jerk.valid) {
+      maximum_jerk =
+          std::max(maximum_jerk,
+                   diagnostics.cartesian_maximum_jerk.value);
+    }
+
+    const std::vector<LateralPathState> &lateral_states =
+        diagnostics.output_lateral_states;
+    const std::vector<LongitudinalState> &longitudinal_states =
+        diagnostics.output_longitudinal_states;
+    input.ego.x = output.next_x[consumed_points - 1];
+    input.ego.y = output.next_y[consumed_points - 1];
+    input.ego.s = lateral_states[consumed_points - 1].road_parameter_s;
+    input.ego.d = lateral_states[consumed_points - 1].planned_d;
+    input.ego.speed_mph =
+        longitudinal_states[consumed_points - 1].v / 0.44704;
+    input.ego.yaw_deg =
+        std::atan2(output.next_y[consumed_points - 1] -
+                       output.next_y[consumed_points - 2],
+                   output.next_x[consumed_points - 1] -
+                       output.next_x[consumed_points - 2]) *
+        180.0 / 3.14159265358979323846;
+    input.previous_path_x.assign(output.next_x.begin() + consumed_points,
+                                 output.next_x.end());
+    input.previous_path_y.assign(output.next_y.begin() + consumed_points,
+                                 output.next_y.end());
+    input.end_path_s = lateral_states.back().road_parameter_s;
+    input.end_path_d = lateral_states.back().planned_d;
+  }
+
+  Expect(transition_length > 15.0,
+         "stationary lane return is sized for its future cruise speed");
+  Expect(planner.last_diagnostics().lateral.remaining_m < 1e-3,
+         "future-speed-sized lateral transition still reaches its endpoint");
+  Expect(maximum_jerk < 10.0,
+         "future-speed sizing keeps full-transition Cartesian jerk bounded: " +
+             std::to_string(maximum_jerk));
+}
+
 void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
   const MapData map = LoadMap("data/highway_map.csv");
   const double lane_center_d = 6.0;
@@ -924,11 +1048,15 @@ int main() {
   RunTest(TestCartesianRuntimeMonitor, "TestCartesianRuntimeMonitor");
   RunTest(TestBaselinePlanner, "TestBaselinePlanner");
   RunTest(TestPlannerStartsWithHistory, "TestPlannerStartsWithHistory");
+  RunTest(TestColdStartUsesHistoricalEndpointState,
+          "TestColdStartUsesHistoricalEndpointState");
   RunTest(TestPlannerStitchesFromHistoricalEndpoint,
           "TestPlannerStitchesFromHistoricalEndpoint");
   RunTest(TestRepeatedReplanningContinuity, "TestRepeatedReplanningContinuity");
   RunTest(TestRepeatedReplanningReturnsToLockedLane,
           "TestRepeatedReplanningReturnsToLockedLane");
+  RunTest(TestLowSpeedLaneReturnUsesFutureSpeedBound,
+          "TestLowSpeedLaneReturnUsesFutureSpeedBound");
   RunTest(TestFixedTerminalRollingTransitionWithQuantizedHistory,
           "TestFixedTerminalRollingTransitionWithQuantizedHistory");
   RunTest(TestEndPathDriftCannotChangeLockedLane,

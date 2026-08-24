@@ -6,6 +6,7 @@
 #include <Eigen/SparseCore>
 
 #include "longitudinal_qp.h"
+#include "map.h"
 #include "qp_solver.h"
 #include "speed_reference.h"
 #include "traffic_predictor.h"
@@ -230,6 +231,8 @@ void TestTrafficPrediction() {
   ExpectNear(ForwardTrackDistance(98.0, 3.0, 100.0), 5.0, 1e-12,
              "forward distance wraps at the track boundary");
 
+  const MapData map = LoadMap("data/highway_map.csv");
+
   PlannerInput input;
   input.previous_path_x.assign(10, 0.0);
   input.previous_path_y.assign(10, 0.0);
@@ -257,15 +260,67 @@ void TestTrafficPrediction() {
   TrafficPredictionConfig config;
   config.lookahead_distance_meters = 50.0;
   const std::vector<PredictedObstacle> predicted =
-      PredictRelevantTraffic(input, 1.0, 6.0, 100.0, config);
+      PredictRelevantTraffic(input, 1.0, 6.0, 6.0, map, config);
   Expect(predicted.size() == 2,
          "traffic predictor keeps the lane and boundary vehicles only");
   if (predicted.size() == 2) {
-    ExpectNear(predicted[0].relative_s, 3.0, 1e-12,
-               "traffic is projected to the previous path endpoint");
+    const double projected_s = AdvanceRoadParameter(
+        ahead.s,
+        ahead.vx_mps * static_cast<double>(input.previous_path_x.size()) *
+            config.simulator_time_step_seconds,
+        6.0, map);
+    const double expected_distance = RoadArcLength(
+        1.0, ForwardTrackDistance(1.0, projected_s, map.track_length), 6.0,
+        map);
+    ExpectNear(predicted[0].relative_s, expected_distance, 1e-9,
+               "traffic projection uses target-lane physical arc length");
     Expect(predicted[1].id == 3.0,
            "vehicle on the lane boundary is conservatively retained");
   }
+}
+
+void TestTrafficCorridorAndCurvedRoadDistance() {
+  const MapData map = LoadMap("data/highway_map.csv");
+  PlannerInput input;
+
+  DetectedVehicle overlapping_corridor;
+  overlapping_corridor.id = 41.0;
+  overlapping_corridor.s = 340.82;
+  overlapping_corridor.d = 3.64;
+  input.traffic.push_back(overlapping_corridor);
+
+  DetectedVehicle separated_adjacent = overlapping_corridor;
+  separated_adjacent.id = 42.0;
+  separated_adjacent.s = 320.0;
+  separated_adjacent.d = 2.0;
+  input.traffic.push_back(separated_adjacent);
+
+  TrafficPredictionConfig prediction_config;
+  const std::vector<PredictedObstacle> predicted = PredictRelevantTraffic(
+      input, 300.0, 4.4, 6.0, map, prediction_config);
+  Expect(predicted.size() == 1 && predicted.front().id == 41.0,
+         "traffic filter covers the complete lateral return corridor");
+  if (predicted.size() != 1) {
+    return;
+  }
+
+  const double raw_parameter_gap = 40.82;
+  const double physical_gap =
+      RoadArcLength(300.0, raw_parameter_gap, 6.0, map);
+  ExpectNear(predicted.front().relative_s, physical_gap, 1e-9,
+             "predicted obstacle distance is measured on the target lane");
+  Expect(physical_gap + 1.0 < raw_parameter_gap,
+         "curved-road regression has a material Frenet/arc-length difference");
+
+  LongitudinalQpConfig qp_config;
+  qp_config.maximum_speed_mps = 20.0;
+  LongitudinalQpInput qp_input;
+  qp_input.initial_speed_mps = 20.0;
+  qp_input.reference_speed_mps.assign(qp_config.horizon_steps + 1, 20.0);
+  qp_input.obstacles = predicted;
+  const LongitudinalQpResult result = LongitudinalQp(qp_config).Solve(qp_input);
+  Expect(!result.success,
+         "physical gap below the configured headway is not accepted as safe");
 }
 
 void TestMonotoneSpeedReference() {
@@ -349,6 +404,7 @@ int main() {
   TestEmergencyStopObjective();
   TestTrajectorySampler();
   TestTrafficPrediction();
+  TestTrafficCorridorAndCurvedRoadDistance();
   TestMonotoneSpeedReference();
   if (failures != 0) {
     std::cerr << failures << " longitudinal test assertion(s) failed"
