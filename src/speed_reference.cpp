@@ -10,6 +10,8 @@
 
 namespace {
 
+constexpr double kSpeedLimitToleranceMps = 1e-9;
+
 class ReferenceIndex {
 public:
   explicit ReferenceIndex(std::size_t steps)
@@ -38,9 +40,58 @@ void ValidateConfig(const SpeedReferenceConfig &config) {
   }
 }
 
+bool HardCollisionActive(const PredictedObstacle &obstacle, std::size_t node,
+                         std::size_t nodes) {
+  return obstacle.hard_collision_active.empty() ||
+         (obstacle.hard_collision_active.size() == nodes &&
+          obstacle.hard_collision_active[node] != 0U);
+}
+
+std::size_t FirstHardCollisionNode(const PredictedObstacle &obstacle,
+                                   std::size_t nodes) {
+  if (obstacle.hard_collision_active.empty()) {
+    return 0;
+  }
+  for (std::size_t node = 0; node < nodes; ++node) {
+    if (HardCollisionActive(obstacle, node, nodes)) {
+      return node;
+    }
+  }
+  return nodes;
+}
+
+double IntrusionSpeedLimitFloor(const PredictedObstacle &obstacle,
+                                double maximum_speed_mps) {
+  double floor = maximum_speed_mps;
+  for (double speed_limit : obstacle.intrusion_speed_limit_mps) {
+    floor = std::min(floor, speed_limit);
+  }
+  return floor;
+}
+
+void ValidateObstaclePrediction(const PredictedObstacle &obstacle,
+                                std::size_t nodes, double maximum_speed_mps) {
+  if (!std::isfinite(obstacle.relative_s) ||
+      !std::isfinite(obstacle.speed_mps) || obstacle.relative_s < 0.0 ||
+      obstacle.speed_mps < 0.0 ||
+      (!obstacle.hard_collision_active.empty() &&
+       obstacle.hard_collision_active.size() != nodes) ||
+      (!obstacle.intrusion_speed_limit_mps.empty() &&
+       obstacle.intrusion_speed_limit_mps.size() != nodes)) {
+    throw std::invalid_argument("invalid obstacle for speed reference");
+  }
+  for (double speed_limit : obstacle.intrusion_speed_limit_mps) {
+    if (!std::isfinite(speed_limit) || speed_limit < 0.0 ||
+        speed_limit > maximum_speed_mps + kSpeedLimitToleranceMps) {
+      throw std::invalid_argument("invalid intrusion speed limit");
+    }
+  }
+}
+
 std::vector<SpeedLimitEvent>
 BuildEvents(const std::vector<PredictedObstacle> &obstacles,
             const SpeedReferenceConfig &config) {
+  const std::size_t nodes = config.horizon_steps + 1;
   const double fixed_gap =
       config.standstill_gap_meters + config.prediction_margin_meters +
       0.5 * (config.ego_length_meters + config.obstacle_length_meters);
@@ -48,10 +99,10 @@ BuildEvents(const std::vector<PredictedObstacle> &obstacles,
       static_cast<double>(config.horizon_steps) * config.time_step_seconds;
   std::vector<SpeedLimitEvent> candidates;
   for (const PredictedObstacle &obstacle : obstacles) {
-    if (!std::isfinite(obstacle.relative_s) ||
-        !std::isfinite(obstacle.speed_mps) || obstacle.relative_s < 0.0 ||
-        obstacle.speed_mps < 0.0) {
-      throw std::invalid_argument("invalid obstacle for speed reference");
+    ValidateObstaclePrediction(obstacle, nodes, config.maximum_speed_mps);
+    const std::size_t first_hard_node = FirstHardCollisionNode(obstacle, nodes);
+    if (first_hard_node == nodes) {
+      continue;
     }
     const double closing_speed = config.maximum_speed_mps - obstacle.speed_mps;
     if (closing_speed <= 1e-6) {
@@ -67,7 +118,12 @@ BuildEvents(const std::vector<PredictedObstacle> &obstacles,
     }
     SpeedLimitEvent event;
     event.conflict_time_seconds = conflict_time;
-    event.speed_limit_mps = obstacle.speed_mps;
+    const double intrusion_floor =
+        IntrusionSpeedLimitFloor(obstacle, config.maximum_speed_mps);
+    event.speed_limit_mps =
+        intrusion_floor < config.maximum_speed_mps - kSpeedLimitToleranceMps
+            ? std::max(obstacle.speed_mps, intrusion_floor)
+            : obstacle.speed_mps;
     candidates.push_back(event);
   }
 
@@ -112,6 +168,15 @@ SpeedReferenceResult SpeedReferenceGenerator::Generate(
   SpeedReferenceResult result;
   result.events = BuildEvents(obstacles, config_);
   result.raw_speed_limits_mps.assign(nodes, config_.maximum_speed_mps);
+  for (const PredictedObstacle &obstacle : obstacles) {
+    if (!obstacle.intrusion_speed_limit_mps.empty()) {
+      for (std::size_t k = 0; k < nodes; ++k) {
+        result.raw_speed_limits_mps[k] =
+            std::min(result.raw_speed_limits_mps[k],
+                     obstacle.intrusion_speed_limit_mps[k]);
+      }
+    }
+  }
   for (const SpeedLimitEvent &event : result.events) {
     const std::size_t event_index =
         std::min(steps, static_cast<std::size_t>(std::floor(
@@ -120,6 +185,10 @@ SpeedReferenceResult SpeedReferenceGenerator::Generate(
       result.raw_speed_limits_mps[k] =
           std::min(result.raw_speed_limits_mps[k], event.speed_limit_mps);
     }
+  }
+  for (std::size_t k = 1; k < nodes; ++k) {
+    result.raw_speed_limits_mps[k] = std::min(
+        result.raw_speed_limits_mps[k], result.raw_speed_limits_mps[k - 1]);
   }
 
   QuadraticProgram problem;

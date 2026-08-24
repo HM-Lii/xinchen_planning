@@ -66,6 +66,8 @@ SpeedReferenceConfig MakeReferenceConfig(const PlannerConfig &config) {
 TrafficPredictionConfig MakeTrafficConfig(const PlannerConfig &config) {
   TrafficPredictionConfig result;
   result.simulator_time_step_seconds = config.time_step_seconds;
+  result.horizon_steps = config.qp_horizon_steps;
+  result.maximum_speed_mps = TargetSpeedMps(config);
   result.lane_width_meters = config.lane_width_meters;
   result.lane_boundary_margin_meters = config.lane_boundary_margin_meters;
   result.ego_width_meters = config.ego_width_meters;

@@ -78,6 +78,8 @@ struct LongitudinalQpResult {
 
 struct TrafficPredictionConfig {
   double simulator_time_step_seconds = 0.02;
+  std::size_t horizon_steps = 80;
+  double maximum_speed_mps = 22.12848;
   double lane_width_meters = 4.0;
   double lane_boundary_margin_meters = 0.35;
   double ego_width_meters = 2.0;
