@@ -1183,7 +1183,7 @@ void TestPlannerTrafficResponse() {
   slow_lead.id = 11.0;
   slow_lead.s = 180.0;
   slow_lead.d = 6.0;
-  slow_lead.vx_mps = 10.0;
+  SetFrenetVelocity(&slow_lead, 10.0, 0.0, map);
   following_input.traffic.push_back(slow_lead);
 
   PathPlanner following_planner;
@@ -1193,11 +1193,93 @@ void TestPlannerTrafficResponse() {
   Expect(following_planner.reference_speed_mps() + 0.2 < free_speed,
          "slow lead vehicle lowers the first-second speed plan");
 
+  const double matched_speed_mps = 15.0;
+  const double desired_gap_meters = 2.0 + 1.0 + 4.8 + 1.5 * matched_speed_mps;
+  const double gap_surplus_meters = 12.0;
+  PlannerInput gap_closing_input = HighwayInput(matched_speed_mps / 0.44704);
+  DetectedVehicle matched_lead;
+  matched_lead.id = 15.0;
+  matched_lead.s =
+      AdvanceRoadParameter(gap_closing_input.ego.s,
+                           desired_gap_meters + gap_surplus_meters, 6.0, map);
+  matched_lead.d = 6.0;
+  SetFrenetVelocity(&matched_lead, matched_speed_mps, 0.0, map);
+  gap_closing_input.traffic.push_back(matched_lead);
+
+  PathPlanner gap_closing_planner;
+  gap_closing_planner.Plan(gap_closing_input, map);
+  const PlannerCycleDiagnostics &gap_closing_diagnostics =
+      gap_closing_planner.last_diagnostics();
+  ExpectNear(gap_closing_diagnostics.reference_first_mps,
+             matched_speed_mps + gap_surplus_meters / 6.0, 1e-3,
+             "planner uses actual ego speed and distance surplus for gradual "
+             "gap closing");
+
+  PlannerInput intrusion_input = free_input;
+  DetectedVehicle intruding_neighbor;
+  intruding_neighbor.id = 14.0;
+  intruding_neighbor.s = 190.0;
+  intruding_neighbor.d = 9.2;
+  SetFrenetVelocity(&intruding_neighbor, 10.0, -2.0, map);
+  intrusion_input.traffic.push_back(intruding_neighbor);
+
+  PathPlanner unintruded_planner;
+  unintruded_planner.Plan(intrusion_input, map);
+  const PlannerCycleDiagnostics &unintruded_diagnostics =
+      unintruded_planner.last_diagnostics();
+  Expect(unintruded_diagnostics.relevant_obstacle_count == 0 &&
+             !unintruded_diagnostics.minimum_intrusion_speed_limit.valid,
+         "a future-only lateral crossing does not affect current planning");
+
+  intrusion_input.traffic.front().d = 8.35;
+  SetFrenetVelocity(&intrusion_input.traffic.front(), 10.0, -2.0, map);
+  PathPlanner intrusion_planner;
+  intrusion_planner.Plan(intrusion_input, map);
+  const PlannerCycleDiagnostics &intrusion_diagnostics =
+      intrusion_planner.last_diagnostics();
+  Expect(!intrusion_planner.last_plan_emergency(),
+         "a current adjacent intrusion is handled by the normal QP");
+  ExpectNear(intrusion_diagnostics.reference_minimum_mps, 10.0, 1e-3,
+             "hard intrusion drives the reference to neighbor speed");
+  Expect(
+      intrusion_diagnostics.minimum_intrusion_speed_limit.valid &&
+          std::fabs(intrusion_diagnostics.minimum_intrusion_speed_limit.value -
+                    10.0) < 1e-9 &&
+          intrusion_diagnostics.intrusion_limiting_obstacle_id == 14.0,
+      "monitor identifies the intrusion speed cap and limiting vehicle");
+  Expect(!intrusion_diagnostics.qp_samples.empty() &&
+             intrusion_diagnostics.qp_samples.front().collision_margin_valid &&
+             intrusion_diagnostics.qp_samples.back().collision_margin_valid,
+         "current hard intrusion remains a body-collision constraint");
+
+  PlannerInput short_headway_input = free_input;
+  DetectedVehicle short_headway_lead = slow_lead;
+  short_headway_lead.id = 13.0;
+  short_headway_lead.s = 112.0;
+  SetFrenetVelocity(&short_headway_lead, free_input.ego.speed_mph * 0.44704,
+                    0.0, map);
+  short_headway_input.traffic.push_back(short_headway_lead);
+
+  PathPlanner short_headway_planner;
+  short_headway_planner.Plan(short_headway_input, map);
+  const PlannerCycleDiagnostics &short_headway_diagnostics =
+      short_headway_planner.last_diagnostics();
+  Expect(!short_headway_planner.last_plan_emergency(),
+         "short time headway alone does not trigger emergency fallback");
+  Expect(short_headway_diagnostics.qp_minimum_headway_margin.valid &&
+             short_headway_diagnostics.qp_minimum_headway_margin.value < 0.0,
+         "planner exposes active soft headway deficit");
+  Expect(short_headway_diagnostics.qp_minimum_collision_margin.valid &&
+             short_headway_diagnostics.qp_minimum_collision_margin.value >
+                 0.0 &&
+             !short_headway_diagnostics.qp_collision_violation,
+         "short-headway plan retains positive hard body clearance");
+
   PlannerInput blocked_input = free_input;
   DetectedVehicle blocked_lead = slow_lead;
   blocked_lead.id = 12.0;
   blocked_lead.s = 120.0;
-  blocked_lead.vx_mps = 0.0;
+  SetFrenetVelocity(&blocked_lead, 0.0, 0.0, map);
   blocked_input.traffic.push_back(blocked_lead);
 
   PathPlanner emergency_planner;
