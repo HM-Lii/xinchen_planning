@@ -81,11 +81,12 @@ sudo chmod u+x {模拟器文件名}
   * Mac：与make相同-[安装Xcode命令行工具](https://developer.apple.com/xcode/features/)
   * Windows：推荐使用[MinGW](http://www.mingw.org/)
 * Boost >= 1.66（需要Boost.System和Boost.Beast）
-* OSQP 1.x（需要提供CMake包和`osqp::osqp`目标）
+* OSQP 1.x（需要提供CMake包和`osqp::osqpstatic`目标）
   * Ubuntu：运行`bash ./install-ubuntu.sh`
   * macOS：运行`bash ./install-mac.sh`
   * 安装脚本会从官方`v1.0.0`源码构建到项目内的`.deps/osqp`
-  * CMake会优先搜索该本地目录，也支持调用者提供的系统级OSQP
+  * CMake会优先搜索该本地目录，也支持提供`osqp::osqpstatic`目标的系统级OSQP
+  * OSQP静态链接到最终程序，运行时不会加载系统中的`libosqp.so`
   * Eigen 3.3头文件已包含在仓库中，QP封装直接使用OSQP C接口
 
 ### 构建与运行

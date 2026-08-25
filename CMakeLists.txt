@@ -33,7 +33,7 @@ target_include_directories(planning_core PUBLIC
 target_include_directories(planning_core SYSTEM PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/Eigen-3.3
 )
-target_link_libraries(planning_core PUBLIC osqp::osqp)
+target_link_libraries(planning_core PUBLIC osqp::osqpstatic)
 
 add_executable(path_planning src/main.cpp)
 target_include_directories(path_planning PRIVATE ${Boost_INCLUDE_DIRS})

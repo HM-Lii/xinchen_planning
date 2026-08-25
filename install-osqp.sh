@@ -5,8 +5,11 @@ script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 osqp_version="v1.0.0"
 osqp_install_prefix="${script_directory}/.deps/osqp"
 osqp_config_file="${osqp_install_prefix}/lib/cmake/osqp/osqp-config.cmake"
+osqp_static_library="${osqp_install_prefix}/lib/libosqpstatic.a"
+osqp_static_targets="${osqp_install_prefix}/lib/cmake/osqp/osqpstatic-targets.cmake"
 
-if [[ -f "${osqp_config_file}" ]]; then
+if [[ -f "${osqp_config_file}" && -f "${osqp_static_library}" &&
+      -f "${osqp_static_targets}" ]]; then
   echo "OSQP ${osqp_version} is already installed in ${osqp_install_prefix}"
   exit 0
 fi
