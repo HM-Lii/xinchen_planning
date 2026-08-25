@@ -31,8 +31,9 @@ struct CscStorage {
 
   OSQPCscMatrix Matrix() {
     OSQPCscMatrix result;
-    csc_set_data(&result, rows, columns, static_cast<OSQPInt>(values.size()),
-                 values.data(), row_indices.data(), column_pointers.data());
+    OSQPCscMatrix_set_data(
+        &result, rows, columns, static_cast<OSQPInt>(values.size()),
+        values.data(), row_indices.data(), column_pointers.data());
     return result;
   }
 };
