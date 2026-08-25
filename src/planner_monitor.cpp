@@ -26,7 +26,7 @@ enum ViolationBit {
   kQpSpeedViolation = 1U << 0,
   kQpAccelerationViolation = 1U << 1,
   kQpJerkViolation = 1U << 2,
-  kQpSafetyViolation = 1U << 3,
+  kQpCollisionViolation = 1U << 3,
   kCartesianSpeedViolation = 1U << 4,
   kCartesianAccelerationViolation = 1U << 5,
   kCartesianJerkViolation = 1U << 6,
@@ -34,6 +34,13 @@ enum ViolationBit {
 };
 
 bool IsFinite(double value) { return std::isfinite(value); }
+
+bool HardCollisionActive(const PredictedObstacle &obstacle,
+                         std::size_t node, std::size_t nodes) {
+  return obstacle.hard_collision_active.empty() ||
+         (obstacle.hard_collision_active.size() == nodes &&
+          obstacle.hard_collision_active[node] != 0U);
+}
 
 void UpdateMinimum(IndexedMetric *metric, double value, std::size_t index) {
   if (!IsFinite(value)) {
@@ -84,8 +91,8 @@ unsigned int ViolationMask(const PlannerCycleDiagnostics &diagnostics) {
   if (diagnostics.qp_jerk_violation) {
     mask |= kQpJerkViolation;
   }
-  if (diagnostics.qp_safety_violation) {
-    mask |= kQpSafetyViolation;
+  if (diagnostics.qp_collision_violation) {
+    mask |= kQpCollisionViolation;
   }
   if (diagnostics.cartesian_speed_violation) {
     mask |= kCartesianSpeedViolation;
@@ -121,8 +128,8 @@ std::string ViolationNames(unsigned int mask) {
   if ((mask & kQpJerkViolation) != 0U) {
     append("qp_jerk");
   }
-  if ((mask & kQpSafetyViolation) != 0U) {
-    append("qp_safety");
+  if ((mask & kQpCollisionViolation) != 0U) {
+    append("qp_collision");
   }
   if ((mask & kCartesianSpeedViolation) != 0U) {
     append("xy_speed");
@@ -234,7 +241,8 @@ void ValidateMonitorLimits(const PlannerMonitorLimits &limits) {
       !IsFinite(limits.maximum_lateral_deviation_meters) ||
       limits.maximum_lateral_deviation_meters <= 0.0 ||
       limits.time_headway_seconds < 0.0 ||
-      limits.fixed_safety_gap_meters < 0.0) {
+      limits.fixed_headway_gap_meters < 0.0 ||
+      limits.collision_gap_meters < 0.0) {
     throw std::invalid_argument("invalid planner monitor limits");
   }
 }
@@ -243,7 +251,7 @@ void ValidateMonitorLimits(const PlannerMonitorLimits &limits) {
 
 bool PlannerCycleDiagnostics::HasViolation() const {
   return qp_speed_violation || qp_acceleration_violation || qp_jerk_violation ||
-         qp_safety_violation || cartesian_speed_violation ||
+         qp_collision_violation || cartesian_speed_violation ||
          cartesian_acceleration_violation || cartesian_jerk_violation ||
          lane_deviation_violation;
 }
@@ -369,6 +377,8 @@ PlannerCycleDiagnostics BuildPlannerDiagnostics(
   diagnostics.relevant_obstacle_count = obstacles.size();
   diagnostics.qp_status = qp_result.status;
   diagnostics.qp_objective = qp_result.objective;
+  diagnostics.qp_maximum_headway_slack_meters =
+      qp_result.maximum_headway_slack_meters;
   diagnostics.emergency = qp_result.trajectory.emergency;
   diagnostics.output_longitudinal_states = output_longitudinal_states;
   diagnostics.output_lateral_states = output_lateral_states;
@@ -386,6 +396,15 @@ PlannerCycleDiagnostics BuildPlannerDiagnostics(
   }
 
   const std::vector<LongitudinalState> &qp_states = qp_result.trajectory.states;
+  for (const PredictedObstacle &obstacle : obstacles) {
+    if ((!obstacle.hard_collision_active.empty() &&
+         obstacle.hard_collision_active.size() != qp_states.size()) ||
+        (!obstacle.intrusion_speed_limit_mps.empty() &&
+         obstacle.intrusion_speed_limit_mps.size() != qp_states.size())) {
+      throw std::invalid_argument(
+          "monitor obstacle prediction and QP node counts differ");
+    }
+  }
   diagnostics.qp_samples.reserve(qp_states.size());
   for (std::size_t node = 0; node < qp_states.size(); ++node) {
     const LongitudinalState &state = qp_states[node];
@@ -406,28 +425,74 @@ PlannerCycleDiagnostics BuildPlannerDiagnostics(
     }
 
     for (const PredictedObstacle &obstacle : obstacles) {
+      if (!obstacle.intrusion_speed_limit_mps.empty()) {
+        const double speed_limit =
+            obstacle.intrusion_speed_limit_mps[node];
+        if (speed_limit < limits.maximum_speed_mps - 1e-9 &&
+            (!sample.intrusion_speed_limit_valid ||
+             speed_limit < sample.minimum_intrusion_speed_limit_mps)) {
+          sample.intrusion_speed_limit_valid = true;
+          sample.minimum_intrusion_speed_limit_mps = speed_limit;
+          sample.intrusion_limiting_obstacle_id = obstacle.id;
+        }
+      }
+      if (!HardCollisionActive(obstacle, node, qp_states.size())) {
+        continue;
+      }
       const double obstacle_s =
           obstacle.relative_s + obstacle.speed_mps * sample.time_seconds;
       const double required_ego_rear_s =
           state.s + limits.time_headway_seconds * state.v;
-      const double margin =
-          obstacle_s - limits.fixed_safety_gap_meters - required_ego_rear_s;
-      if (!sample.safety_margin_valid ||
-          margin < sample.minimum_safety_margin_meters) {
-        sample.safety_margin_valid = true;
-        sample.minimum_safety_margin_meters = margin;
-        sample.limiting_obstacle_id = obstacle.id;
+      const double headway_margin = obstacle_s -
+                                    limits.fixed_headway_gap_meters -
+                                    required_ego_rear_s;
+      if (!sample.headway_margin_valid ||
+          headway_margin < sample.minimum_headway_margin_meters) {
+        sample.headway_margin_valid = true;
+        sample.minimum_headway_margin_meters = headway_margin;
+        sample.headway_limiting_obstacle_id = obstacle.id;
+      }
+      const double collision_margin =
+          obstacle_s - limits.collision_gap_meters - state.s;
+      if (!sample.collision_margin_valid ||
+          collision_margin < sample.minimum_collision_margin_meters) {
+        sample.collision_margin_valid = true;
+        sample.minimum_collision_margin_meters = collision_margin;
+        sample.collision_limiting_obstacle_id = obstacle.id;
       }
     }
-    if (sample.safety_margin_valid &&
-        (!diagnostics.qp_minimum_safety_margin.valid ||
-         sample.minimum_safety_margin_meters <
-             diagnostics.qp_minimum_safety_margin.value)) {
-      diagnostics.qp_minimum_safety_margin.valid = true;
-      diagnostics.qp_minimum_safety_margin.value =
-          sample.minimum_safety_margin_meters;
-      diagnostics.qp_minimum_safety_margin.index = node;
-      diagnostics.qp_limiting_obstacle_id = sample.limiting_obstacle_id;
+    if (sample.intrusion_speed_limit_valid &&
+        (!diagnostics.minimum_intrusion_speed_limit.valid ||
+         sample.minimum_intrusion_speed_limit_mps <
+             diagnostics.minimum_intrusion_speed_limit.value)) {
+      diagnostics.minimum_intrusion_speed_limit.valid = true;
+      diagnostics.minimum_intrusion_speed_limit.value =
+          sample.minimum_intrusion_speed_limit_mps;
+      diagnostics.minimum_intrusion_speed_limit.index = node;
+      diagnostics.intrusion_limiting_obstacle_id =
+          sample.intrusion_limiting_obstacle_id;
+    }
+    if (sample.headway_margin_valid &&
+        (!diagnostics.qp_minimum_headway_margin.valid ||
+         sample.minimum_headway_margin_meters <
+             diagnostics.qp_minimum_headway_margin.value)) {
+      diagnostics.qp_minimum_headway_margin.valid = true;
+      diagnostics.qp_minimum_headway_margin.value =
+          sample.minimum_headway_margin_meters;
+      diagnostics.qp_minimum_headway_margin.index = node;
+      diagnostics.qp_headway_limiting_obstacle_id =
+          sample.headway_limiting_obstacle_id;
+    }
+    if (sample.collision_margin_valid &&
+        (!diagnostics.qp_minimum_collision_margin.valid ||
+         sample.minimum_collision_margin_meters <
+             diagnostics.qp_minimum_collision_margin.value)) {
+      diagnostics.qp_minimum_collision_margin.valid = true;
+      diagnostics.qp_minimum_collision_margin.value =
+          sample.minimum_collision_margin_meters;
+      diagnostics.qp_minimum_collision_margin.index = node;
+      diagnostics.qp_collision_limiting_obstacle_id =
+          sample.collision_limiting_obstacle_id;
     }
     diagnostics.qp_samples.push_back(sample);
   }
@@ -522,8 +587,9 @@ PlannerCycleDiagnostics BuildPlannerDiagnostics(
   diagnostics.qp_jerk_violation =
       Above(diagnostics.qp_maximum_absolute_jerk,
             limits.maximum_jerk_mps3 + limits.jerk_tolerance_mps3);
-  diagnostics.qp_safety_violation = Below(diagnostics.qp_minimum_safety_margin,
-                                          -limits.safety_tolerance_meters);
+  diagnostics.qp_collision_violation = Below(
+      diagnostics.qp_minimum_collision_margin,
+      -limits.safety_tolerance_meters);
 
   diagnostics.cartesian_speed_violation =
       Above(diagnostics.cartesian_maximum_speed,
@@ -603,10 +669,15 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
            "lateral_progress_m,lateral_remaining_m,lateral_residual_m,"
            "lateral_frontier_d,obstacle_count,"
            "nearest_obstacle_m,reference_first_mps,reference_min_mps,"
-           "reference_last_mps,qp_status,qp_objective,emergency,qp_v_min,"
+           "reference_last_mps,qp_status,qp_objective,"
+           "qp_headway_slack_max_m,emergency,qp_v_min,"
            "qp_v_min_index,qp_v_max,qp_v_max_index,qp_a_min,qp_a_min_index,"
            "qp_a_max,qp_a_max_index,qp_abs_j_max,qp_abs_j_max_index,"
-           "qp_safety_margin_min,qp_safety_index,qp_limiting_obstacle_id,"
+           "intrusion_speed_limit_min,intrusion_speed_limit_index,"
+           "intrusion_limiting_obstacle_id,"
+           "qp_headway_margin_min,qp_headway_index,"
+           "qp_headway_limiting_obstacle_id,qp_collision_margin_min,"
+           "qp_collision_index,qp_collision_limiting_obstacle_id,"
            "xy_metrics_new_path_only,history_xy_residual_max_m,"
            "history_xy_residual_max_index,"
            "xy_v_max,xy_v_max_index,xy_tan_a_min,xy_tan_a_min_index,"
@@ -621,8 +692,12 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
            "lateral_state_valid,lateral_transition_id,lateral_progress_m,"
            "road_parameter_s,planned_d\n";
   qp_csv_ << "session_id,cycle,node,time_s,s,v_mps,a_mps2,j_mps3,"
-             "reference_v_mps,safety_margin_valid,min_safety_margin_m,"
-             "limiting_obstacle_id,emergency\n";
+             "reference_v_mps,intrusion_speed_limit_valid,"
+             "min_intrusion_speed_limit_mps,intrusion_limiting_obstacle_id,"
+             "headway_margin_valid,min_headway_margin_m,"
+             "headway_limiting_obstacle_id,collision_margin_valid,"
+             "min_collision_margin_m,collision_limiting_obstacle_id,"
+             "emergency\n";
   csv_available_ = true;
 }
 
@@ -657,6 +732,7 @@ void PlannerRuntimeMonitor::WriteCycleCsv(
       << diagnostics.reference_minimum_mps << ','
       << diagnostics.reference_last_mps << ',' << CsvSafe(diagnostics.qp_status)
       << ',' << diagnostics.qp_objective << ','
+      << diagnostics.qp_maximum_headway_slack_meters << ','
       << static_cast<int>(diagnostics.emergency) << ','
       << MetricValueOrNan(diagnostics.qp_minimum_speed) << ','
       << MetricIndexOrNegativeOne(diagnostics.qp_minimum_speed) << ','
@@ -668,9 +744,15 @@ void PlannerRuntimeMonitor::WriteCycleCsv(
       << MetricIndexOrNegativeOne(diagnostics.qp_maximum_acceleration) << ','
       << MetricValueOrNan(diagnostics.qp_maximum_absolute_jerk) << ','
       << MetricIndexOrNegativeOne(diagnostics.qp_maximum_absolute_jerk) << ','
-      << MetricValueOrNan(diagnostics.qp_minimum_safety_margin) << ','
-      << MetricIndexOrNegativeOne(diagnostics.qp_minimum_safety_margin) << ','
-      << diagnostics.qp_limiting_obstacle_id << ','
+      << MetricValueOrNan(diagnostics.minimum_intrusion_speed_limit) << ','
+      << MetricIndexOrNegativeOne(diagnostics.minimum_intrusion_speed_limit)
+      << ',' << diagnostics.intrusion_limiting_obstacle_id << ','
+      << MetricValueOrNan(diagnostics.qp_minimum_headway_margin) << ','
+      << MetricIndexOrNegativeOne(diagnostics.qp_minimum_headway_margin) << ','
+      << diagnostics.qp_headway_limiting_obstacle_id << ','
+      << MetricValueOrNan(diagnostics.qp_minimum_collision_margin) << ','
+      << MetricIndexOrNegativeOne(diagnostics.qp_minimum_collision_margin)
+      << ',' << diagnostics.qp_collision_limiting_obstacle_id << ','
       << static_cast<int>(diagnostics.cartesian_metrics_new_path_only) << ','
       << MetricValueOrNan(diagnostics.historical_path_position_residual) << ','
       << MetricIndexOrNegativeOne(
@@ -759,13 +841,30 @@ void PlannerRuntimeMonitor::WriteDetailCsv(
             << sample.node_index << ',' << sample.time_seconds << ','
             << sample.state.s << ',' << sample.state.v << ',' << sample.state.a
             << ',' << sample.state.j << ',' << sample.reference_speed_mps << ','
-            << static_cast<int>(sample.safety_margin_valid) << ','
-            << (sample.safety_margin_valid
-                    ? sample.minimum_safety_margin_meters
+            << static_cast<int>(sample.intrusion_speed_limit_valid) << ','
+            << (sample.intrusion_speed_limit_valid
+                    ? sample.minimum_intrusion_speed_limit_mps
                     : std::numeric_limits<double>::quiet_NaN())
             << ','
-            << (sample.safety_margin_valid
-                    ? sample.limiting_obstacle_id
+            << (sample.intrusion_speed_limit_valid
+                    ? sample.intrusion_limiting_obstacle_id
+                    : std::numeric_limits<double>::quiet_NaN())
+            << ','
+            << static_cast<int>(sample.headway_margin_valid) << ','
+            << (sample.headway_margin_valid
+                    ? sample.minimum_headway_margin_meters
+                    : std::numeric_limits<double>::quiet_NaN())
+            << ','
+            << (sample.headway_margin_valid
+                    ? sample.headway_limiting_obstacle_id
+                    : std::numeric_limits<double>::quiet_NaN())
+            << ',' << static_cast<int>(sample.collision_margin_valid) << ','
+            << (sample.collision_margin_valid
+                    ? sample.minimum_collision_margin_meters
+                    : std::numeric_limits<double>::quiet_NaN())
+            << ','
+            << (sample.collision_margin_valid
+                    ? sample.collision_limiting_obstacle_id
                     : std::numeric_limits<double>::quiet_NaN())
             << ',' << static_cast<int>(diagnostics.emergency) << '\n';
   }
@@ -785,11 +884,18 @@ void PlannerRuntimeMonitor::PrintSummary(
        << " ref(first/min/last)=" << diagnostics.reference_first_mps << '/'
        << diagnostics.reference_minimum_mps << '/'
        << diagnostics.reference_last_mps << " init_j="
-       << diagnostics.initial_jerk_mps3 << " qp(vmax/amin/amax/jmax)="
+       << diagnostics.initial_jerk_mps3 << " headway_slack_max="
+       << diagnostics.qp_maximum_headway_slack_meters
+       << " intrusion_v_limit="
+       << MetricText(diagnostics.minimum_intrusion_speed_limit)
+       << " qp(vmax/amin/amax/jmax)="
        << MetricText(diagnostics.qp_maximum_speed) << '/'
        << MetricText(diagnostics.qp_minimum_acceleration) << '/'
        << MetricText(diagnostics.qp_maximum_acceleration) << '/'
        << MetricText(diagnostics.qp_maximum_absolute_jerk)
+       << " qp_margin(headway/collision)="
+       << MetricText(diagnostics.qp_minimum_headway_margin) << '/'
+       << MetricText(diagnostics.qp_minimum_collision_margin)
        << " xy(v/a/j)=" << MetricText(diagnostics.cartesian_maximum_speed)
        << '/' << MetricText(diagnostics.cartesian_maximum_acceleration) << '/'
        << MetricText(diagnostics.cartesian_maximum_jerk)
@@ -820,12 +926,14 @@ void PlannerRuntimeMonitor::PrintViolation(
        << " prev/new=" << diagnostics.previous_path_size << '/'
        << diagnostics.new_point_count
        << " lane_d(start/center)=" << diagnostics.plan_start_d << '/'
-       << diagnostics.lane_center_d << " qp(vmax/amin/amax/jmax/safety)="
+       << diagnostics.lane_center_d
+       << " qp(vmax/amin/amax/jmax/headway/collision)="
        << MetricText(diagnostics.qp_maximum_speed) << '/'
        << MetricText(diagnostics.qp_minimum_acceleration) << '/'
        << MetricText(diagnostics.qp_maximum_acceleration) << '/'
        << MetricText(diagnostics.qp_maximum_absolute_jerk) << '/'
-       << MetricText(diagnostics.qp_minimum_safety_margin)
+       << MetricText(diagnostics.qp_minimum_headway_margin) << '/'
+       << MetricText(diagnostics.qp_minimum_collision_margin)
        << " xy(v/tan_a/a/tan_j/j)="
        << MetricText(diagnostics.cartesian_maximum_speed) << '/'
        << MetricText(diagnostics.cartesian_maximum_tangential_acceleration)

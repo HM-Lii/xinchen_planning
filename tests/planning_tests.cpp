@@ -1,6 +1,6 @@
 #include <algorithm>
-#include <cstdio>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -44,6 +44,29 @@ std::vector<std::string> ReadLines(const std::string &path) {
     lines.push_back(line);
   }
   return lines;
+}
+
+std::size_t CsvFieldCount(const std::string &line) {
+  return static_cast<std::size_t>(std::count(line.begin(), line.end(), ',')) +
+         1;
+}
+
+void SetFrenetVelocity(DetectedVehicle *vehicle, double longitudinal_speed_mps,
+                       double lateral_speed_mps, const MapData &map) {
+  const RoadGeometrySample road =
+      EvaluateRoadGeometry(vehicle->s, vehicle->d, map);
+  const RoadGeometrySample center = EvaluateRoadGeometry(vehicle->s, 0.0, map);
+  const RoadGeometrySample unit_offset =
+      EvaluateRoadGeometry(vehicle->s, 1.0, map);
+  const double normal_x = unit_offset.x - center.x;
+  const double normal_y = unit_offset.y - center.y;
+  const double metric =
+      std::hypot(road.first_derivative_x, road.first_derivative_y);
+  const double parameter_rate = longitudinal_speed_mps / metric;
+  vehicle->vx_mps =
+      road.first_derivative_x * parameter_rate + normal_x * lateral_speed_mps;
+  vehicle->vy_mps =
+      road.first_derivative_y * parameter_rate + normal_y * lateral_speed_mps;
 }
 
 MapData SquareMap() {
@@ -280,7 +303,8 @@ void TestCartesianRuntimeMonitor() {
       {}, {10.0, 10.0}, qp_result, output_states, limits);
   Expect(!diagnostics.qp_speed_violation &&
              !diagnostics.qp_acceleration_violation &&
-             !diagnostics.qp_jerk_violation,
+             !diagnostics.qp_jerk_violation &&
+             !diagnostics.qp_collision_violation,
          "monitor keeps a compliant QP classified as compliant");
   Expect(diagnostics.cartesian_speed_violation &&
              diagnostics.cartesian_acceleration_violation &&
@@ -299,6 +323,35 @@ void TestCartesianRuntimeMonitor() {
   Expect(lane_departure.lane_deviation_violation &&
              lane_departure.HasViolation(),
          "monitor flags departure from the locked lane center");
+
+  limits.time_headway_seconds = 1.5;
+  limits.fixed_headway_gap_meters = 7.8;
+  limits.collision_gap_meters = 4.8;
+  PredictedObstacle short_headway_lead;
+  short_headway_lead.id = 21.0;
+  short_headway_lead.relative_s = 20.0;
+  short_headway_lead.speed_mps = 10.0;
+  const PlannerCycleDiagnostics short_headway = BuildPlannerDiagnostics(
+      9, input, smooth, 2, qp_result.trajectory.states[0], 0.0, 6.0, 6.0,
+      {short_headway_lead}, {10.0, 10.0}, qp_result, output_states, limits);
+  Expect(short_headway.qp_minimum_headway_margin.valid &&
+             short_headway.qp_minimum_headway_margin.value < 0.0,
+         "monitor records a negative soft headway margin");
+  Expect(short_headway.qp_minimum_collision_margin.valid &&
+             short_headway.qp_minimum_collision_margin.value > 0.0 &&
+             !short_headway.qp_collision_violation &&
+             !short_headway.HasViolation(),
+         "soft headway deficit is not classified as a hard violation");
+
+  PredictedObstacle overlapping_lead = short_headway_lead;
+  overlapping_lead.relative_s = 4.0;
+  const PlannerCycleDiagnostics overlap = BuildPlannerDiagnostics(
+      10, input, smooth, 2, qp_result.trajectory.states[0], 0.0, 6.0, 6.0,
+      {overlapping_lead}, {10.0, 10.0}, qp_result, output_states, limits);
+  Expect(overlap.qp_minimum_collision_margin.valid &&
+             overlap.qp_minimum_collision_margin.value < 0.0 &&
+             overlap.qp_collision_violation && overlap.HasViolation(),
+         "monitor classifies body overlap as a hard collision violation");
 }
 
 void TestRuntimeMonitorStartsWithCleanCsvLogs() {
@@ -311,6 +364,7 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
   config.enabled = true;
   config.write_csv = true;
   config.log_directory = directory;
+  config.detail_csv_interval_cycles = 1;
 
   {
     PlannerRuntimeMonitor first_monitor(config);
@@ -324,6 +378,8 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
     PlannerRuntimeMonitor second_monitor(config);
     PlannerCycleDiagnostics second;
     second.cycle = 2;
+    second.cartesian_samples.push_back(CartesianKinematicSample());
+    second.qp_samples.push_back(QpNodeMonitorSample());
     second_monitor.Record(second);
   }
 
@@ -335,10 +391,20 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
   Expect(cycle_lines.size() == 2 &&
              cycle_lines[1].find(",2,") != std::string::npos,
          "the clean cycle log contains only the new run");
-  Expect(point_lines.size() == 1,
-         "a new monitor run replaces the previous point log");
-  Expect(qp_lines.size() == 1,
-         "a new monitor run replaces the previous QP log");
+  Expect(point_lines.size() == 2 &&
+             point_lines[1].find(",2,") != std::string::npos,
+         "the clean point log contains only the new run");
+  Expect(qp_lines.size() == 2 && qp_lines[1].find(",2,") != std::string::npos,
+         "the clean QP log contains only the new run");
+  Expect(cycle_lines.size() == 2 &&
+             CsvFieldCount(cycle_lines[0]) == CsvFieldCount(cycle_lines[1]),
+         "cycle CSV header and data keep the same field count");
+  Expect(point_lines.size() == 2 &&
+             CsvFieldCount(point_lines[0]) == CsvFieldCount(point_lines[1]),
+         "point CSV header and data keep the same field count");
+  Expect(qp_lines.size() == 2 &&
+             CsvFieldCount(qp_lines[0]) == CsvFieldCount(qp_lines[1]),
+         "QP CSV header and data keep the same field count");
 
   std::remove(cycle_path.c_str());
   std::remove(point_path.c_str());
@@ -354,8 +420,7 @@ void TestCartesianMonitorUsesAlignedStitchingFrame() {
   input.ego.speed_mph = 10.0 / 0.44704;
 
   PlannerOutput output;
-  output.next_x = {0.201, 0.401, 0.601, 0.801,
-                   1.001, 1.201, 1.401};
+  output.next_x = {0.201, 0.401, 0.601, 0.801, 1.001, 1.201, 1.401};
   output.next_y.assign(output.next_x.size(), 0.0);
   input.previous_path_x.assign(output.next_x.begin(),
                                output.next_x.begin() + 4);
@@ -378,8 +443,7 @@ void TestCartesianMonitorUsesAlignedStitchingFrame() {
   for (std::size_t index = 0; index < lateral_states.size(); ++index) {
     lateral_states[index].valid = true;
     lateral_states[index].expected_x =
-        index < 4 ? 0.2 * static_cast<double>(index + 1)
-                  : output.next_x[index];
+        index < 4 ? 0.2 * static_cast<double>(index + 1) : output.next_x[index];
   }
   LateralStitchDiagnostics lateral;
   lateral.state_aligned = true;
@@ -394,13 +458,13 @@ void TestCartesianMonitorUsesAlignedStitchingFrame() {
   limits.maximum_cartesian_jerk_mps3 = 10.0;
 
   const PlannerCycleDiagnostics diagnostics = BuildPlannerDiagnostics(
-      9, input, output, 4, qp_result.trajectory.states[0], 0.0, 6.0, 6.0,
-      {}, {10.0, 10.0}, qp_result, output_states, limits, lateral,
-      lateral_states, true);
+      9, input, output, 4, qp_result.trajectory.states[0], 0.0, 6.0, 6.0, {},
+      {10.0, 10.0}, qp_result, output_states, limits, lateral, lateral_states,
+      true);
   Expect(diagnostics.historical_path_position_residual.valid,
          "monitor retains the raw history quantization residual");
-  ExpectNear(diagnostics.historical_path_position_residual.value, 0.001,
-             1e-12, "monitor measures the history endpoint offset");
+  ExpectNear(diagnostics.historical_path_position_residual.value, 0.001, 1e-12,
+             "monitor measures the history endpoint offset");
   Expect(diagnostics.cartesian_maximum_acceleration.valid &&
              diagnostics.cartesian_maximum_acceleration.value < 1e-6,
          "a shared stitching frame removes false Cartesian acceleration");
@@ -492,15 +556,13 @@ void TestColdStartUsesHistoricalEndpointState() {
       EvaluateRoadGeometry(input.ego.s, lane_d, map);
   input.ego.x = ego_geometry.x;
   input.ego.y = ego_geometry.y;
-  input.ego.yaw_deg =
-      std::atan2(ego_geometry.first_derivative_y,
-                 ego_geometry.first_derivative_x) *
-      180.0 / 3.14159265358979323846;
+  input.ego.yaw_deg = std::atan2(ego_geometry.first_derivative_y,
+                                 ego_geometry.first_derivative_x) *
+                      180.0 / 3.14159265358979323846;
 
   double road_s = input.ego.s;
   for (std::size_t index = 0; index < 40; ++index) {
-    const double speed =
-        10.0 + 2.0 * static_cast<double>(index + 1) / 40.0;
+    const double speed = 10.0 + 2.0 * static_cast<double>(index + 1) / 40.0;
     road_s = AdvanceRoadParameter(road_s, speed * time_step, lane_d, map);
     const RoadGeometrySample point = EvaluateRoadGeometry(road_s, lane_d, map);
     input.previous_path_x.push_back(point.x);
@@ -841,10 +903,9 @@ void TestLowSpeedLaneReturnUsesFutureSpeedBound() {
       EvaluateRoadGeometry(input.ego.s, input.ego.d, map);
   input.ego.x = initial_geometry.x;
   input.ego.y = initial_geometry.y;
-  input.ego.yaw_deg =
-      std::atan2(initial_geometry.first_derivative_y,
-                 initial_geometry.first_derivative_x) *
-      180.0 / 3.14159265358979323846;
+  input.ego.yaw_deg = std::atan2(initial_geometry.first_derivative_y,
+                                 initial_geometry.first_derivative_x) *
+                      180.0 / 3.14159265358979323846;
   input.ego.speed_mph = 0.0;
 
   PathPlanner planner;
@@ -862,8 +923,7 @@ void TestLowSpeedLaneReturnUsesFutureSpeedBound() {
     }
     if (diagnostics.cartesian_maximum_jerk.valid) {
       maximum_jerk =
-          std::max(maximum_jerk,
-                   diagnostics.cartesian_maximum_jerk.value);
+          std::max(maximum_jerk, diagnostics.cartesian_maximum_jerk.value);
     }
 
     const std::vector<LateralPathState> &lateral_states =
@@ -874,14 +934,12 @@ void TestLowSpeedLaneReturnUsesFutureSpeedBound() {
     input.ego.y = output.next_y[consumed_points - 1];
     input.ego.s = lateral_states[consumed_points - 1].road_parameter_s;
     input.ego.d = lateral_states[consumed_points - 1].planned_d;
-    input.ego.speed_mph =
-        longitudinal_states[consumed_points - 1].v / 0.44704;
-    input.ego.yaw_deg =
-        std::atan2(output.next_y[consumed_points - 1] -
-                       output.next_y[consumed_points - 2],
-                   output.next_x[consumed_points - 1] -
-                       output.next_x[consumed_points - 2]) *
-        180.0 / 3.14159265358979323846;
+    input.ego.speed_mph = longitudinal_states[consumed_points - 1].v / 0.44704;
+    input.ego.yaw_deg = std::atan2(output.next_y[consumed_points - 1] -
+                                       output.next_y[consumed_points - 2],
+                                   output.next_x[consumed_points - 1] -
+                                       output.next_x[consumed_points - 2]) *
+                        180.0 / 3.14159265358979323846;
     input.previous_path_x.assign(output.next_x.begin() + consumed_points,
                                  output.next_x.end());
     input.previous_path_y.assign(output.next_y.begin() + consumed_points,
@@ -912,11 +970,10 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
       EvaluateRoadGeometry(input.ego.s, input.ego.d, map);
   input.ego.x = initial_geometry.x;
   input.ego.y = initial_geometry.y;
-  input.ego.yaw_deg =
-      std::atan2(initial_geometry.first_derivative_y,
-                 initial_geometry.first_derivative_x) *
-          180.0 / 3.14159265358979323846 +
-      0.3;
+  input.ego.yaw_deg = std::atan2(initial_geometry.first_derivative_y,
+                                 initial_geometry.first_derivative_x) *
+                          180.0 / 3.14159265358979323846 +
+                      0.3;
   input.ego.speed_mph = 16.0 / 0.44704;
 
   PathPlanner planner;
@@ -956,8 +1013,7 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
              "active transition refits once at each rolling frontier");
       if (should_roll) {
         ExpectNear(diagnostics.lateral.rolling_origin_m, previous_progress,
-                   1e-8,
-                   "new quintic starts at the previous planned frontier");
+                   1e-8, "new quintic starts at the previous planned frontier");
         Expect(diagnostics.lateral.rolling_replan_count ==
                    previous_rolling_replan_count + 1,
                "rolling replan counter advances exactly once");
@@ -970,8 +1026,7 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
              "millimeter history error remains a small position residual");
       if (expected_frontier_valid) {
         ExpectNear(diagnostics.initial_speed_mps, expected_frontier_state.v,
-                   1e-9,
-                   "rolling QP inherits the saved frontier speed");
+                   1e-9, "rolling QP inherits the saved frontier speed");
         ExpectNear(diagnostics.initial_acceleration_mps2,
                    expected_frontier_state.a, 1e-9,
                    "rolling QP inherits the saved frontier acceleration");
@@ -986,16 +1041,14 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
     Expect(diagnostics.lateral.progress_m + 1e-9 >= previous_progress,
            "lateral polynomial progress never moves backward");
     previous_progress = diagnostics.lateral.progress_m;
-    previous_rolling_replan_count =
-        diagnostics.lateral.rolling_replan_count;
+    previous_rolling_replan_count = diagnostics.lateral.rolling_replan_count;
     Expect(!diagnostics.qp_speed_violation &&
                !diagnostics.qp_acceleration_violation &&
                !diagnostics.qp_jerk_violation,
            "quantized history cannot corrupt QP hard constraints");
     Expect(diagnostics.output_lateral_states.size() == output.next_x.size(),
            "monitor retains one lateral state per output point");
-    for (const LateralPathState &state :
-         diagnostics.output_lateral_states) {
+    for (const LateralPathState &state : diagnostics.output_lateral_states) {
       Expect(state.valid, "generated path keeps valid lateral states");
       Expect(state.planned_d >= 4.0 && state.planned_d <= 8.0,
              "quintic lateral profile remains inside the locked lane");
@@ -1007,25 +1060,21 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
         2U + static_cast<std::size_t>(cycle % 6);
     const LateralPathState &ego_lateral_state =
         diagnostics.output_lateral_states[consumed_points - 1];
-    const double ego_x = RoundToMillimeter(
-        output.next_x[consumed_points - 1]);
-    const double ego_y = RoundToMillimeter(
-        output.next_y[consumed_points - 1]);
-    const FrenetProjection ego_projection = ProjectToRoad(
-        ego_x, ego_y, ego_lateral_state.road_parameter_s, map);
+    const double ego_x = RoundToMillimeter(output.next_x[consumed_points - 1]);
+    const double ego_y = RoundToMillimeter(output.next_y[consumed_points - 1]);
+    const FrenetProjection ego_projection =
+        ProjectToRoad(ego_x, ego_y, ego_lateral_state.road_parameter_s, map);
     input.ego.x = ego_x;
     input.ego.y = ego_y;
     input.ego.s = ego_projection.s;
     input.ego.d = ego_projection.d;
     input.ego.speed_mph =
-        diagnostics.output_longitudinal_states[consumed_points - 1].v /
-        0.44704;
-    input.ego.yaw_deg =
-        std::atan2(output.next_y[consumed_points - 1] -
-                       output.next_y[consumed_points - 2],
-                   output.next_x[consumed_points - 1] -
-                       output.next_x[consumed_points - 2]) *
-        180.0 / 3.14159265358979323846;
+        diagnostics.output_longitudinal_states[consumed_points - 1].v / 0.44704;
+    input.ego.yaw_deg = std::atan2(output.next_y[consumed_points - 1] -
+                                       output.next_y[consumed_points - 2],
+                                   output.next_x[consumed_points - 1] -
+                                       output.next_x[consumed_points - 2]) *
+                        180.0 / 3.14159265358979323846;
 
     input.previous_path_x.clear();
     input.previous_path_y.clear();
@@ -1041,9 +1090,8 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
         end_lateral_state.road_parameter_s, map);
     input.end_path_s = end_projection.s;
     input.end_path_d = end_projection.d;
-    maximum_end_lateral_error =
-        std::max(maximum_end_lateral_error,
-                 std::fabs(input.end_path_d - lane_center_d));
+    maximum_end_lateral_error = std::max(
+        maximum_end_lateral_error, std::fabs(input.end_path_d - lane_center_d));
     Expect(input.end_path_d >= 4.0 && input.end_path_d <= 8.0,
            "quantized Cartesian path stays inside the locked lane");
   }
@@ -1135,7 +1183,7 @@ void TestPlannerTrafficResponse() {
   slow_lead.id = 11.0;
   slow_lead.s = 180.0;
   slow_lead.d = 6.0;
-  slow_lead.vx_mps = 10.0;
+  SetFrenetVelocity(&slow_lead, 10.0, 0.0, map);
   following_input.traffic.push_back(slow_lead);
 
   PathPlanner following_planner;
@@ -1145,17 +1193,99 @@ void TestPlannerTrafficResponse() {
   Expect(following_planner.reference_speed_mps() + 0.2 < free_speed,
          "slow lead vehicle lowers the first-second speed plan");
 
+  const double matched_speed_mps = 15.0;
+  const double desired_gap_meters = 2.0 + 1.0 + 4.8 + 1.5 * matched_speed_mps;
+  const double gap_surplus_meters = 12.0;
+  PlannerInput gap_closing_input = HighwayInput(matched_speed_mps / 0.44704);
+  DetectedVehicle matched_lead;
+  matched_lead.id = 15.0;
+  matched_lead.s =
+      AdvanceRoadParameter(gap_closing_input.ego.s,
+                           desired_gap_meters + gap_surplus_meters, 6.0, map);
+  matched_lead.d = 6.0;
+  SetFrenetVelocity(&matched_lead, matched_speed_mps, 0.0, map);
+  gap_closing_input.traffic.push_back(matched_lead);
+
+  PathPlanner gap_closing_planner;
+  gap_closing_planner.Plan(gap_closing_input, map);
+  const PlannerCycleDiagnostics &gap_closing_diagnostics =
+      gap_closing_planner.last_diagnostics();
+  ExpectNear(gap_closing_diagnostics.reference_first_mps,
+             matched_speed_mps + gap_surplus_meters / 6.0, 1e-3,
+             "planner uses actual ego speed and distance surplus for gradual "
+             "gap closing");
+
+  PlannerInput intrusion_input = free_input;
+  DetectedVehicle intruding_neighbor;
+  intruding_neighbor.id = 14.0;
+  intruding_neighbor.s = 190.0;
+  intruding_neighbor.d = 9.2;
+  SetFrenetVelocity(&intruding_neighbor, 10.0, -2.0, map);
+  intrusion_input.traffic.push_back(intruding_neighbor);
+
+  PathPlanner unintruded_planner;
+  unintruded_planner.Plan(intrusion_input, map);
+  const PlannerCycleDiagnostics &unintruded_diagnostics =
+      unintruded_planner.last_diagnostics();
+  Expect(unintruded_diagnostics.relevant_obstacle_count == 0 &&
+             !unintruded_diagnostics.minimum_intrusion_speed_limit.valid,
+         "a future-only lateral crossing does not affect current planning");
+
+  intrusion_input.traffic.front().d = 8.35;
+  SetFrenetVelocity(&intrusion_input.traffic.front(), 10.0, -2.0, map);
+  PathPlanner intrusion_planner;
+  intrusion_planner.Plan(intrusion_input, map);
+  const PlannerCycleDiagnostics &intrusion_diagnostics =
+      intrusion_planner.last_diagnostics();
+  Expect(!intrusion_planner.last_plan_emergency(),
+         "a current adjacent intrusion is handled by the normal QP");
+  ExpectNear(intrusion_diagnostics.reference_minimum_mps, 10.0, 1e-3,
+             "hard intrusion drives the reference to neighbor speed");
+  Expect(
+      intrusion_diagnostics.minimum_intrusion_speed_limit.valid &&
+          std::fabs(intrusion_diagnostics.minimum_intrusion_speed_limit.value -
+                    10.0) < 1e-9 &&
+          intrusion_diagnostics.intrusion_limiting_obstacle_id == 14.0,
+      "monitor identifies the intrusion speed cap and limiting vehicle");
+  Expect(!intrusion_diagnostics.qp_samples.empty() &&
+             intrusion_diagnostics.qp_samples.front().collision_margin_valid &&
+             intrusion_diagnostics.qp_samples.back().collision_margin_valid,
+         "current hard intrusion remains a body-collision constraint");
+
+  PlannerInput short_headway_input = free_input;
+  DetectedVehicle short_headway_lead = slow_lead;
+  short_headway_lead.id = 13.0;
+  short_headway_lead.s = 112.0;
+  SetFrenetVelocity(&short_headway_lead, free_input.ego.speed_mph * 0.44704,
+                    0.0, map);
+  short_headway_input.traffic.push_back(short_headway_lead);
+
+  PathPlanner short_headway_planner;
+  short_headway_planner.Plan(short_headway_input, map);
+  const PlannerCycleDiagnostics &short_headway_diagnostics =
+      short_headway_planner.last_diagnostics();
+  Expect(!short_headway_planner.last_plan_emergency(),
+         "short time headway alone does not trigger emergency fallback");
+  Expect(short_headway_diagnostics.qp_minimum_headway_margin.valid &&
+             short_headway_diagnostics.qp_minimum_headway_margin.value < 0.0,
+         "planner exposes active soft headway deficit");
+  Expect(short_headway_diagnostics.qp_minimum_collision_margin.valid &&
+             short_headway_diagnostics.qp_minimum_collision_margin.value >
+                 0.0 &&
+             !short_headway_diagnostics.qp_collision_violation,
+         "short-headway plan retains positive hard body clearance");
+
   PlannerInput blocked_input = free_input;
   DetectedVehicle blocked_lead = slow_lead;
   blocked_lead.id = 12.0;
   blocked_lead.s = 120.0;
-  blocked_lead.vx_mps = 0.0;
+  SetFrenetVelocity(&blocked_lead, 0.0, 0.0, map);
   blocked_input.traffic.push_back(blocked_lead);
 
   PathPlanner emergency_planner;
   emergency_planner.Plan(blocked_input, map);
   Expect(emergency_planner.last_plan_emergency(),
-         "already violated safety boundary triggers emergency fallback");
+         "predicted unavoidable body collision triggers emergency fallback");
   Expect(emergency_planner.reference_speed_mps() <
              blocked_input.ego.speed_mph * 0.44704,
          "emergency fallback commands a lower speed");

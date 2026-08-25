@@ -23,12 +23,14 @@ struct PlannerConfig {
   double reference_min_acceleration_mps2 = -2.5;
   double reference_max_jerk_mps3 = 2.0;
   double time_headway_seconds = 1.5;
+  double gap_closing_time_seconds = 6.0;
   double standstill_gap_meters = 2.0;
   double ego_length_meters = 4.8;
   double obstacle_length_meters = 4.8;
   double ego_width_meters = 2.0;
   double obstacle_width_meters = 2.0;
   double prediction_margin_meters = 1.0;
+  double headway_slack_weight = 200.0;
   double traffic_lookahead_meters = 250.0;
   double lane_boundary_margin_meters = 0.35;
   double lane_width_meters = 4.0;
