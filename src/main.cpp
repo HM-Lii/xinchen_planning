@@ -51,7 +51,10 @@ int main() {
         continue;
       }
       std::cout << "Connected" << std::endl;
-      PathPlanner planner;
+      PlannerConfig planner_config;
+      planner_config.monitor.enabled = true;
+      planner_config.monitor.write_csv = true;
+      PathPlanner planner(planner_config);
 
       for (;;) {
         beast::flat_buffer buffer;
