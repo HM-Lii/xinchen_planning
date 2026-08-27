@@ -30,7 +30,10 @@ enum ViolationBit {
   kCartesianSpeedViolation = 1U << 4,
   kCartesianAccelerationViolation = 1U << 5,
   kCartesianJerkViolation = 1U << 6,
-  kLaneDeviationViolation = 1U << 7
+  kLaneDeviationViolation = 1U << 7,
+  kInfrastructureFailure = 1U << 8,
+  kInvalidValidatedCandidate = 1U << 9,
+  kMinimumRiskDispatch = 1U << 10
 };
 
 bool IsFinite(double value) { return std::isfinite(value); }
@@ -106,6 +109,16 @@ unsigned int ViolationMask(const PlannerCycleDiagnostics &diagnostics) {
   if (diagnostics.lane_deviation_violation) {
     mask |= kLaneDeviationViolation;
   }
+  if (diagnostics.infrastructure_failure) {
+    mask |= kInfrastructureFailure;
+  }
+  if (diagnostics.plan_disposition == PlanDisposition::kValidatedCandidate &&
+      !diagnostics.validation_valid) {
+    mask |= kInvalidValidatedCandidate;
+  }
+  if (diagnostics.minimum_risk_dispatch) {
+    mask |= kMinimumRiskDispatch;
+  }
   return mask;
 }
 
@@ -143,6 +156,15 @@ std::string ViolationNames(unsigned int mask) {
   if ((mask & kLaneDeviationViolation) != 0U) {
     append("lane_deviation");
   }
+  if ((mask & kInfrastructureFailure) != 0U) {
+    append("infrastructure_failure");
+  }
+  if ((mask & kInvalidValidatedCandidate) != 0U) {
+    append("invalid_validated_candidate");
+  }
+  if ((mask & kMinimumRiskDispatch) != 0U) {
+    append("minimum_risk_dispatch");
+  }
   return names.str();
 }
 
@@ -163,6 +185,30 @@ std::string CsvSafe(std::string text) {
     }
   }
   return text;
+}
+
+std::string ObjectIdList(const std::vector<double> &object_ids) {
+  std::ostringstream text;
+  text << std::setprecision(15);
+  for (std::size_t index = 0; index < object_ids.size(); ++index) {
+    if (index != 0) {
+      text << '|';
+    }
+    text << object_ids[index];
+  }
+  return text.str();
+}
+
+const char *LongitudinalSafetyPolicyName(LongitudinalSafetyPolicy policy) {
+  switch (policy) {
+  case LongitudinalSafetyPolicy::kNormalOperational:
+    return "NormalOperational";
+  case LongitudinalSafetyPolicy::kDegradedBraking:
+    return "DegradedBraking";
+  case LongitudinalSafetyPolicy::kMaximumBraking:
+    return "MaximumBraking";
+  }
+  return "Unknown";
 }
 
 bool DirectoryExists(const std::string &path) {
@@ -253,7 +299,10 @@ bool PlannerCycleDiagnostics::HasViolation() const {
   return qp_speed_violation || qp_acceleration_violation || qp_jerk_violation ||
          qp_collision_violation || cartesian_speed_violation ||
          cartesian_acceleration_violation || cartesian_jerk_violation ||
-         lane_deviation_violation;
+         lane_deviation_violation || infrastructure_failure ||
+         (plan_disposition == PlanDisposition::kValidatedCandidate &&
+          !validation_valid) ||
+         minimum_risk_dispatch;
 }
 
 std::vector<CartesianKinematicSample> ComputeCartesianKinematics(
@@ -643,13 +692,29 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
   const std::string point_path =
       JoinPath(config_.log_directory, "planner_points.csv");
   const std::string qp_path = JoinPath(config_.log_directory, "planner_qp.csv");
+  const std::string control_candidate_path =
+      JoinPath(config_.log_directory, "planner_control_candidates.csv");
+  const std::string behavior_candidate_path =
+      JoinPath(config_.log_directory, "planner_behavior_candidates.csv");
+  const std::string collision_path =
+      JoinPath(config_.log_directory, "planner_collision_events.csv");
   cycle_csv_.open(cycle_path.c_str(), std::ios::out | std::ios::trunc);
   point_csv_.open(point_path.c_str(), std::ios::out | std::ios::trunc);
   qp_csv_.open(qp_path.c_str(), std::ios::out | std::ios::trunc);
-  if (!cycle_csv_ || !point_csv_ || !qp_csv_) {
+  control_candidate_csv_.open(control_candidate_path.c_str(),
+                              std::ios::out | std::ios::trunc);
+  behavior_candidate_csv_.open(behavior_candidate_path.c_str(),
+                               std::ios::out | std::ios::trunc);
+  collision_csv_.open(collision_path.c_str(),
+                      std::ios::out | std::ios::trunc);
+  if (!cycle_csv_ || !point_csv_ || !qp_csv_ || !control_candidate_csv_ ||
+      !behavior_candidate_csv_ || !collision_csv_) {
     cycle_csv_.close();
     point_csv_.close();
     qp_csv_.close();
+    control_candidate_csv_.close();
+    behavior_candidate_csv_.close();
+    collision_csv_.close();
     std::cerr << "[MONITOR][WARNING] cannot open CSV files in: "
               << config_.log_directory << std::endl;
     return;
@@ -657,6 +722,9 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
   cycle_csv_ << std::setprecision(12);
   point_csv_ << std::setprecision(12);
   qp_csv_ << std::setprecision(12);
+  control_candidate_csv_ << std::setprecision(12);
+  behavior_candidate_csv_ << std::setprecision(12);
+  collision_csv_ << std::setprecision(12);
   cycle_csv_
       << "session_id,cycle,previous_size,new_count,ego_speed_mps,"
            "initial_speed_mps,initial_acceleration_mps2,initial_jerk_mps3,"
@@ -683,7 +751,63 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
            "xy_v_max,xy_v_max_index,xy_tan_a_min,xy_tan_a_min_index,"
            "xy_tan_a_max,xy_tan_a_max_index,xy_a_max,xy_a_max_index,"
            "xy_abs_tan_j_max,xy_abs_tan_j_max_index,xy_j_max,xy_j_max_index,"
-           "junction_speed_mps,junction_index,violation_mask\n";
+           "junction_speed_mps,junction_index,violation_mask,operating_mode,"
+           "requested_operating_mode,behavior_phase,"
+           "behavior_lane_change_selected,behavior_first_commit,"
+           "behavior_continuation,behavior_source_lane,behavior_target_lane,"
+           "behavior_commit_cycle,behavior_stable_proposal_cycles,"
+           "behavior_target_stable_cycles,behavior_oscillation_count,"
+           "behavior_completed_maneuver_count,"
+           "behavior_cancelled_proposal_count,"
+           "behavior_evaluation_attempted,behavior_evaluation_succeeded,"
+           "behavior_transaction_committed,behavior_error_stage,"
+           "behavior_error_detail,behavior_result_cycle,"
+           "behavior_tracker_reset_reason,behavior_observed_track_count,"
+           "behavior_valid_track_count,behavior_admissible_track_count,"
+           "behavior_stale_track_count,behavior_reacquired_track_count,"
+           "behavior_reused_id_count,"
+           "behavior_prediction_trajectory_count,"
+           "behavior_admissible_prediction_count,"
+           "behavior_generated_candidate_count,behavior_stable_gap_count,"
+           "behavior_coarse_admitted_count,"
+           "behavior_spatial_evaluated_count,"
+           "behavior_spatial_generated_count,behavior_spatial_passed_count,"
+           "behavior_st_evaluated_count,"
+           "behavior_st_corridor_ready_count,"
+           "behavior_st_corridor_empty_count,"
+           "behavior_st_prediction_rejected_count,"
+           "behavior_st_curvature_rejected_count,"
+           "behavior_st_qp_attempted_count,behavior_st_qp_solved_count,"
+           "behavior_st_qp_failed_count,"
+           "behavior_st_horizon_rejected_count,"
+           "behavior_st_deadline_skipped_count,"
+           "behavior_final_candidate_count,behavior_final_valid_count,"
+           "behavior_final_validation_rejected_count,"
+           "behavior_has_best_valid_candidate,behavior_best_candidate_id,"
+           "behavior_best_target_lane,"
+           "behavior_full_validation_rejection_count,"
+           "behavior_tightening_attempt_count,"
+           "behavior_tightening_success_count,"
+           "candidate_id,plan_disposition,fallback_level,original_previous_size,"
+           "retained_prefix_points,planning_frontier_delay_s,state_source,"
+           "state_reset_reason,validation_valid,first_violation_type,"
+           "first_violation_time_s,minimum_physical_margin_m,"
+           "minimum_operational_margin_m,maximum_headway_slack_m,"
+           "collision_unavoidable,infrastructure_failure,"
+           "infrastructure_failure_reason,minimum_risk_dispatch,"
+           "minimum_risk_reason,predicted_collision_object_count,"
+           "predicted_first_collision_time_s,"
+           "predicted_relative_collision_speed_mps,traffic_vehicle_count,"
+           "shielded_same_lane_rear_count,"
+           "shielded_same_lane_rear_object_ids,"
+           "validation_min_collision_margin_m,has_first_collision_evidence,"
+           "first_collision_object_id,first_collision_check_kind,"
+           "first_collision_point_index,first_collision_time_s,"
+           "first_collision_overlap_m,first_collision_relative_s_m,"
+           "first_collision_relative_d_m,first_collision_closing_speed_mps,"
+           "first_collision_qp_relevant,first_collision_retained_prefix,"
+           "first_collision_stitch_boundary,full_trajectory_points,"
+           "evaluate_time_ms,validate_time_ms\n";
   point_csv_
       << "session_id,cycle,index,is_previous,x,y,vx_mps,vy_mps,speed_mps,"
            "ax_mps2,ay_mps2,acceleration_mps2,tangential_acceleration_mps2,"
@@ -698,6 +822,118 @@ void PlannerRuntimeMonitor::EnsureCsvStreams() {
              "headway_limiting_obstacle_id,collision_margin_valid,"
              "min_collision_margin_m,collision_limiting_obstacle_id,"
              "emergency\n";
+  control_candidate_csv_
+      << "session_id,cycle,candidate_id,safety_policy,fallback_level,"
+         "minimum_risk_candidate,selected_for_dispatch,has_plan,"
+         "validation_valid,failure_reason,failure_detail,qp_success,"
+         "qp_hard_safe,qp_status,qp_min_physical_margin_m,"
+         "qp_min_operational_margin_m,qp_max_headway_slack_m,"
+         "qp_max_collision_violation_m,validation_min_collision_margin_m,"
+         "validation_min_road_margin_m,shielded_same_lane_rear_count,"
+         "shielded_same_lane_rear_object_ids,collision_object_count,"
+         "first_collision_object_id,first_collision_time_s,"
+         "first_collision_check_kind,evaluate_time_ms,validate_time_ms\n";
+  behavior_candidate_csv_
+      << "session_id,cycle,candidate_id,behavior,source_lane,target_lane,"
+         "passing_order,behavior_status,gap_has_front_vehicle,"
+         "gap_front_vehicle_id,gap_has_rear_vehicle,gap_rear_vehicle_id,"
+         "stable_observations,stable_duration_s,estimated_progress_m,"
+         "estimated_progress_gain_m,estimated_speed_gain_mps,"
+         "uncertainty_cost,admission_evaluated,"
+         "admission_passed,admission_rejection_reasons,has_front_margin,"
+         "minimum_front_margin_m,has_rear_margin,minimum_rear_margin_m,"
+         "has_rear_ttc,minimum_rear_ttc_s,reachable_center_overlap_m,"
+         "has_source_front_margin,minimum_source_front_margin_m,"
+         "source_front_limiting_vehicle_id,source_front_limiting_time_s,"
+         "source_front_limiting_ego_road_s_m,"
+         "source_front_limiting_occupied_min_road_s_m,"
+         "source_front_limiting_occupied_max_road_s_m,"
+         "source_front_limiting_min_rate_mps,"
+         "source_front_limiting_max_rate_mps,"
+         "source_front_limiting_uncertainty_m,"
+         "source_front_limiting_hypothesis,"
+         "source_front_risk_observed,first_source_front_risk_time_s,"
+         "first_source_front_risk_vehicle_id,"
+         "first_source_front_risk_margin_m,"
+         "first_source_front_risk_hypothesis,"
+         "target_kinematic_failure_observed,"
+         "first_target_kinematic_failure_time_s,"
+         "first_target_propagated_state_count,"
+         "first_target_feasible_state_count,"
+         "first_target_best_front_margin_m,"
+         "first_target_best_rear_margin_m,"
+         "first_target_best_rear_ttc_margin_m,"
+         "gap_current_observation_valid,gap_topology_consistent,"
+         "topology_failure_observed,first_topology_failure_kind,"
+         "first_topology_failure_time_s,"
+         "first_topology_expected_front_found,"
+         "first_topology_expected_rear_found,"
+         "first_topology_actual_front_present,"
+         "first_topology_actual_front_vehicle_id,"
+         "first_topology_actual_rear_present,"
+         "first_topology_actual_rear_vehicle_id,"
+         "expected_boundaries_reversed_observed,"
+         "first_expected_boundaries_reversed_time_s,"
+         "merge_corridor_intrusion_observed,"
+         "first_merge_corridor_intrusion_time_s,"
+         "first_merge_corridor_intrusion_vehicle_id,"
+         "first_merge_corridor_intrusion_hypothesis,"
+         "merge_corridor_blocked_observed,"
+         "first_merge_corridor_blocked_time_s,"
+         "first_merge_corridor_candidate_state_count,"
+         "first_merge_corridor_feasible_state_count,"
+         "first_merge_corridor_blocking_vehicle_id,"
+         "first_merge_corridor_blocking_hypothesis,"
+         "first_merge_corridor_blocking_margin_m,"
+         "prediction_evidence_complete,"
+         "minimum_gap_window_m,spatial_evaluated,spatial_status,"
+         "spatial_precheck_passed,spatial_rejection_reasons,"
+         "spatial_transition_length_m,spatial_path_extent_m,"
+         "spatial_completion_progress_m,spatial_minimum_road_margin_m,"
+         "spatial_speed_upper_bound_mps,"
+         "spatial_maximum_lateral_acceleration_mps2,"
+         "spatial_maximum_lateral_jerk_mps3,st_evaluated,st_status,"
+         "st_prediction_evidence_complete,st_corridor_empty,"
+         "st_first_evidence_failure_node,st_first_empty_node,"
+         "st_minimum_width_m,st_minimum_width_node,"
+         "st_minimum_width_lower_source_present,"
+         "st_minimum_width_lower_source_vehicle_id,"
+         "st_minimum_width_upper_source_present,"
+         "st_minimum_width_upper_source_vehicle_id,"
+         "st_first_empty_lower_source_present,"
+         "st_first_empty_lower_source_vehicle_id,"
+         "st_first_empty_upper_source_present,"
+         "st_first_empty_upper_source_vehicle_id,"
+         "st_curvature_initial_speed_feasible,st_minimum_speed_limit_mps,"
+         "st_qp_attempted,st_qp_success,st_qp_bounds_satisfied,st_qp_status,"
+         "st_qp_objective,st_terminal_progress_m,st_terminal_speed_mps,"
+         "st_source_lane_departed_in_time,"
+         "st_source_lane_departure_time_s,"
+         "st_source_lane_departure_deadline_s,"
+         "st_lane_change_completed_in_time,"
+         "st_lane_change_completion_time_s,"
+         "st_lane_change_completion_deadline_s,st_minimum_lower_margin_m,"
+         "st_minimum_upper_margin_m,st_maximum_speed_excess_mps,"
+         "final_evaluated,final_status,best_valid_candidate,"
+         "selected_for_dispatch,tightening_attempted,tightening_succeeded,"
+         "final_validation_valid,final_rejection_detail,"
+         "final_minimum_physical_margin_m,"
+         "final_minimum_operational_margin_m,final_minimum_road_margin_m,"
+         "final_maximum_acceleration_mps2,final_maximum_jerk_mps3,"
+         "final_minimum_longitudinal_acceleration_mps2,"
+         "final_cost\n";
+  collision_csv_
+      << "session_id,cycle,candidate_id,safety_policy,fallback_level,"
+         "minimum_risk_candidate,selected_for_dispatch,object_id,"
+         "check_kind,point_index,time_s,box_separation_m,overlap_m,"
+         "retained_prefix,stitch_boundary,ego_x_m,ego_y_m,ego_road_s_m,"
+         "ego_d_m,ego_speed_mps,obstacle_x_m,obstacle_y_m,"
+         "obstacle_road_s_m,obstacle_d_m,obstacle_speed_mps,"
+         "relative_road_s_m,relative_d_m,closing_speed_mps,"
+         "center_distance_m,observed_x_m,observed_y_m,observed_road_s_m,"
+         "observed_d_m,observed_vx_mps,observed_vy_mps,observed_speed_mps,"
+         "observed_road_s_speed_mps,observed_d_rate_mps,qp_relevant,"
+         "qp_initial_relative_s_m,qp_predicted_speed_mps,qp_obstacle_d_m\n";
   csv_available_ = true;
 }
 
@@ -782,7 +1018,134 @@ void PlannerRuntimeMonitor::WriteCycleCsv(
       << MetricIndexOrNegativeOne(diagnostics.cartesian_maximum_jerk) << ','
       << MetricValueOrNan(diagnostics.new_path_junction_speed) << ','
       << MetricIndexOrNegativeOne(diagnostics.new_path_junction_speed) << ','
-      << ViolationMask(diagnostics) << '\n';
+      << ViolationMask(diagnostics) << ','
+      << static_cast<int>(diagnostics.operating_mode) << ','
+      << static_cast<int>(diagnostics.requested_operating_mode) << ','
+      << CsvSafe(diagnostics.behavior_phase) << ','
+      << static_cast<int>(diagnostics.behavior_lane_change_selected) << ','
+      << static_cast<int>(diagnostics.behavior_first_commit) << ','
+      << static_cast<int>(diagnostics.behavior_continuation) << ','
+      << diagnostics.behavior_source_lane << ','
+      << diagnostics.behavior_target_lane << ','
+      << diagnostics.behavior_commit_cycle << ','
+      << diagnostics.behavior_stable_proposal_cycles << ','
+      << diagnostics.behavior_target_stable_cycles << ','
+      << diagnostics.behavior_oscillation_count << ','
+      << diagnostics.behavior_completed_maneuver_count << ','
+      << diagnostics.behavior_cancelled_proposal_count << ','
+      << static_cast<int>(diagnostics.behavior_evaluation_attempted) << ','
+      << static_cast<int>(diagnostics.behavior_evaluation_succeeded) << ','
+      << static_cast<int>(diagnostics.behavior_transaction_committed) << ','
+      << CsvSafe(diagnostics.behavior_error_stage) << ','
+      << CsvSafe(diagnostics.behavior_error_detail) << ','
+      << diagnostics.behavior_result_cycle << ','
+      << CsvSafe(diagnostics.behavior_tracker_reset_reason) << ','
+      << diagnostics.behavior_observed_track_count << ','
+      << diagnostics.behavior_valid_track_count << ','
+      << diagnostics.behavior_admissible_track_count << ','
+      << diagnostics.behavior_stale_track_count << ','
+      << diagnostics.behavior_reacquired_track_count << ','
+      << diagnostics.behavior_reused_id_count << ','
+      << diagnostics.behavior_prediction_trajectory_count << ','
+      << diagnostics.behavior_admissible_prediction_count << ','
+      << diagnostics.behavior_generated_candidate_count << ','
+      << diagnostics.behavior_stable_gap_count << ','
+      << diagnostics.behavior_coarse_admitted_count << ','
+      << diagnostics.behavior_spatial_evaluated_count << ','
+      << diagnostics.behavior_spatial_generated_count << ','
+      << diagnostics.behavior_spatial_passed_count << ','
+      << diagnostics.behavior_st_evaluated_count << ','
+      << diagnostics.behavior_st_corridor_ready_count << ','
+      << diagnostics.behavior_st_corridor_empty_count << ','
+      << diagnostics.behavior_st_prediction_rejected_count << ','
+      << diagnostics.behavior_st_curvature_rejected_count << ','
+      << diagnostics.behavior_st_qp_attempted_count << ','
+      << diagnostics.behavior_st_qp_solved_count << ','
+      << diagnostics.behavior_st_qp_failed_count << ','
+      << diagnostics.behavior_st_horizon_rejected_count << ','
+      << diagnostics.behavior_st_deadline_skipped_count << ','
+      << diagnostics.behavior_final_candidate_count << ','
+      << diagnostics.behavior_final_valid_count << ','
+      << diagnostics.behavior_final_validation_rejected_count << ','
+      << static_cast<int>(diagnostics.behavior_has_best_valid_candidate) << ','
+      << diagnostics.behavior_best_candidate_id << ','
+      << diagnostics.behavior_best_target_lane << ','
+      << diagnostics.behavior_full_validation_rejection_count << ','
+      << diagnostics.behavior_tightening_attempt_count << ','
+      << diagnostics.behavior_tightening_success_count << ','
+      << diagnostics.candidate_id << ','
+      << static_cast<int>(diagnostics.plan_disposition) << ','
+      << static_cast<int>(diagnostics.fallback_level) << ','
+      << diagnostics.original_previous_path_size << ','
+      << diagnostics.retained_prefix_points << ','
+      << diagnostics.planning_frontier_delay_s << ','
+      << static_cast<int>(diagnostics.state_source) << ','
+      << static_cast<int>(diagnostics.state_reset_reason) << ','
+      << static_cast<int>(diagnostics.validation_valid) << ','
+      << CsvSafe(diagnostics.first_violation_type) << ','
+      << diagnostics.first_violation_time_s << ','
+      << diagnostics.minimum_physical_margin_m << ','
+      << diagnostics.minimum_operational_margin_m << ','
+      << diagnostics.maximum_headway_slack_m << ','
+      << static_cast<int>(diagnostics.collision_unavoidable) << ','
+      << static_cast<int>(diagnostics.infrastructure_failure) << ','
+      << CsvSafe(diagnostics.infrastructure_failure_reason) << ','
+      << static_cast<int>(diagnostics.minimum_risk_dispatch) << ','
+      << CsvSafe(diagnostics.minimum_risk_reason) << ','
+      << diagnostics.predicted_collision_object_count << ','
+      << diagnostics.predicted_first_collision_time_s << ','
+      << diagnostics.predicted_relative_collision_speed_mps << ','
+      << diagnostics.traffic_vehicle_count << ','
+      << diagnostics.shielded_same_lane_rear_vehicle_ids.size() << ','
+      << ObjectIdList(diagnostics.shielded_same_lane_rear_vehicle_ids) << ','
+      << diagnostics.validation_minimum_collision_margin_m << ','
+      << static_cast<int>(diagnostics.has_first_collision_evidence) << ','
+      << (diagnostics.has_first_collision_evidence
+              ? diagnostics.first_collision.evidence.object_id
+              : std::numeric_limits<double>::quiet_NaN())
+      << ','
+      << (diagnostics.has_first_collision_evidence
+              ? CollisionCheckKindName(
+                    diagnostics.first_collision.evidence.check_kind)
+              : "None")
+      << ','
+      << (diagnostics.has_first_collision_evidence
+              ? static_cast<long long>(
+                    diagnostics.first_collision.evidence.point_index)
+              : -1LL)
+      << ','
+      << (diagnostics.has_first_collision_evidence
+              ? diagnostics.first_collision.evidence.time_from_telemetry_s
+              : 0.0)
+      << ','
+      << (diagnostics.has_first_collision_evidence
+              ? diagnostics.first_collision.evidence.overlap_m
+              : 0.0)
+      << ','
+      << (diagnostics.has_first_collision_evidence
+              ? diagnostics.first_collision.evidence.relative_road_s_m
+              : std::numeric_limits<double>::quiet_NaN())
+      << ','
+      << (diagnostics.has_first_collision_evidence
+              ? diagnostics.first_collision.evidence.relative_d_m
+              : std::numeric_limits<double>::quiet_NaN())
+      << ','
+      << (diagnostics.has_first_collision_evidence
+              ? diagnostics.first_collision.evidence.closing_speed_mps
+              : std::numeric_limits<double>::quiet_NaN())
+      << ','
+      << static_cast<int>(diagnostics.has_first_collision_evidence &&
+                          diagnostics.first_collision.qp_relevant)
+      << ','
+      << static_cast<int>(diagnostics.has_first_collision_evidence &&
+                          diagnostics.first_collision.evidence.retained_prefix)
+      << ','
+      << static_cast<int>(diagnostics.has_first_collision_evidence &&
+                          diagnostics.first_collision.evidence.stitch_boundary)
+      << ','
+      << diagnostics.full_trajectory_points << ','
+      << diagnostics.evaluate_time_ms << ',' << diagnostics.validate_time_ms
+      << '\n';
 }
 
 void PlannerRuntimeMonitor::WriteDetailCsv(
@@ -870,6 +1233,255 @@ void PlannerRuntimeMonitor::WriteDetailCsv(
   }
 }
 
+void PlannerRuntimeMonitor::WriteControlCandidateCsv(
+    const PlannerCycleDiagnostics &diagnostics) {
+  for (const ControlCandidateDiagnostics &candidate :
+       diagnostics.control_candidates) {
+    const CollisionEventDiagnostics *first =
+        candidate.collision_events.empty()
+            ? nullptr
+            : &candidate.collision_events.front();
+    control_candidate_csv_
+        << session_id_ << ',' << diagnostics.cycle << ','
+        << candidate.candidate_id << ','
+        << LongitudinalSafetyPolicyName(candidate.safety_policy) << ','
+        << static_cast<int>(candidate.fallback_level) << ','
+        << static_cast<int>(candidate.minimum_risk_candidate) << ','
+        << static_cast<int>(candidate.selected_for_dispatch) << ','
+        << static_cast<int>(candidate.has_plan) << ','
+        << static_cast<int>(candidate.validation_valid) << ','
+        << CsvSafe(candidate.failure_reason) << ','
+        << CsvSafe(candidate.failure_detail) << ','
+        << static_cast<int>(candidate.qp_success) << ','
+        << static_cast<int>(candidate.qp_hard_safe) << ','
+        << CsvSafe(candidate.qp_status) << ','
+        << candidate.qp_minimum_physical_margin_m << ','
+        << candidate.qp_minimum_operational_margin_m << ','
+        << candidate.qp_maximum_headway_slack_m << ','
+        << candidate.qp_maximum_collision_violation_m << ','
+        << candidate.validation_minimum_collision_margin_m << ','
+        << candidate.validation_minimum_road_margin_m << ','
+        << candidate.shielded_same_lane_rear_vehicle_ids.size() << ','
+        << ObjectIdList(candidate.shielded_same_lane_rear_vehicle_ids) << ','
+        << candidate.collision_events.size() << ','
+        << (first != nullptr
+                ? first->evidence.object_id
+                : std::numeric_limits<double>::quiet_NaN())
+        << ','
+        << (first != nullptr ? first->evidence.time_from_telemetry_s : 0.0)
+        << ','
+        << (first != nullptr
+                ? CollisionCheckKindName(first->evidence.check_kind)
+                : "None")
+        << ',' << candidate.evaluate_time_ms << ','
+        << candidate.validate_time_ms << '\n';
+  }
+}
+
+void PlannerRuntimeMonitor::WriteBehaviorCandidateCsv(
+    const PlannerCycleDiagnostics &diagnostics) {
+  for (const BehaviorCandidateDiagnostics &candidate :
+       diagnostics.behavior_candidates) {
+    behavior_candidate_csv_
+        << session_id_ << ',' << diagnostics.cycle << ','
+        << candidate.candidate_id << ',' << CsvSafe(candidate.behavior) << ','
+        << candidate.source_lane << ',' << candidate.target_lane << ','
+        << CsvSafe(candidate.passing_order) << ','
+        << CsvSafe(candidate.behavior_status) << ','
+        << static_cast<int>(candidate.gap_has_front_vehicle) << ','
+        << candidate.gap_front_vehicle_id << ','
+        << static_cast<int>(candidate.gap_has_rear_vehicle) << ','
+        << candidate.gap_rear_vehicle_id << ','
+        << candidate.stable_observations << ','
+        << candidate.stable_duration_s << ','
+        << candidate.estimated_progress_m << ','
+        << candidate.estimated_progress_gain_m << ','
+        << candidate.estimated_speed_gain_mps << ','
+        << candidate.uncertainty_cost << ','
+        << static_cast<int>(candidate.admission_evaluated) << ','
+        << static_cast<int>(candidate.admission_passed) << ','
+        << CsvSafe(candidate.admission_rejection_reasons) << ','
+        << static_cast<int>(candidate.has_front_margin) << ','
+        << candidate.minimum_front_margin_m << ','
+        << static_cast<int>(candidate.has_rear_margin) << ','
+        << candidate.minimum_rear_margin_m << ','
+        << static_cast<int>(candidate.has_rear_ttc) << ','
+        << candidate.minimum_rear_ttc_s << ','
+        << candidate.reachable_center_overlap_m << ','
+        << static_cast<int>(candidate.has_source_front_margin) << ','
+        << candidate.minimum_source_front_margin_m << ','
+        << candidate.source_front_limiting_vehicle_id << ','
+        << candidate.source_front_limiting_time_s << ','
+        << candidate.source_front_limiting_ego_road_s_m << ','
+        << candidate.source_front_limiting_occupied_min_road_s_m << ','
+        << candidate.source_front_limiting_occupied_max_road_s_m << ','
+        << candidate.source_front_limiting_min_rate_mps << ','
+        << candidate.source_front_limiting_max_rate_mps << ','
+        << candidate.source_front_limiting_uncertainty_m << ','
+        << CsvSafe(candidate.source_front_limiting_hypothesis) << ','
+        << static_cast<int>(candidate.source_front_risk_observed) << ','
+        << candidate.first_source_front_risk_time_s << ','
+        << candidate.first_source_front_risk_vehicle_id << ','
+        << candidate.first_source_front_risk_margin_m << ','
+        << CsvSafe(candidate.first_source_front_risk_hypothesis) << ','
+        << static_cast<int>(candidate.target_kinematic_failure_observed)
+        << ',' << candidate.first_target_kinematic_failure_time_s << ','
+        << candidate.first_target_propagated_state_count << ','
+        << candidate.first_target_feasible_state_count << ','
+        << candidate.first_target_best_front_margin_m << ','
+        << candidate.first_target_best_rear_margin_m << ','
+        << candidate.first_target_best_rear_ttc_margin_m << ','
+        << static_cast<int>(candidate.gap_current_observation_valid) << ','
+        << static_cast<int>(candidate.gap_topology_consistent) << ','
+        << static_cast<int>(candidate.topology_failure_observed) << ','
+        << CsvSafe(candidate.first_topology_failure_kind) << ','
+        << candidate.first_topology_failure_time_s << ','
+        << static_cast<int>(
+               candidate.first_topology_expected_front_found)
+        << ','
+        << static_cast<int>(
+               candidate.first_topology_expected_rear_found)
+        << ','
+        << static_cast<int>(
+               candidate.first_topology_actual_front_present)
+        << ',' << candidate.first_topology_actual_front_vehicle_id << ','
+        << static_cast<int>(
+               candidate.first_topology_actual_rear_present)
+        << ',' << candidate.first_topology_actual_rear_vehicle_id << ','
+        << static_cast<int>(
+               candidate.expected_boundaries_reversed_observed)
+        << ',' << candidate.first_expected_boundaries_reversed_time_s
+        << ','
+        << static_cast<int>(candidate.merge_corridor_intrusion_observed)
+        << ',' << candidate.first_merge_corridor_intrusion_time_s << ','
+        << candidate.first_merge_corridor_intrusion_vehicle_id << ','
+        << CsvSafe(candidate.first_merge_corridor_intrusion_hypothesis)
+        << ',' << static_cast<int>(
+                       candidate.merge_corridor_blocked_observed)
+        << ',' << candidate.first_merge_corridor_blocked_time_s << ','
+        << candidate.first_merge_corridor_candidate_state_count << ','
+        << candidate.first_merge_corridor_feasible_state_count << ','
+        << candidate.first_merge_corridor_blocking_vehicle_id << ','
+        << CsvSafe(candidate.first_merge_corridor_blocking_hypothesis)
+        << ',' << candidate.first_merge_corridor_blocking_margin_m << ','
+        << static_cast<int>(candidate.prediction_evidence_complete) << ','
+        << candidate.minimum_gap_window_m << ','
+        << static_cast<int>(candidate.spatial_evaluated) << ','
+        << CsvSafe(candidate.spatial_status) << ','
+        << static_cast<int>(candidate.spatial_precheck_passed) << ','
+        << CsvSafe(candidate.spatial_rejection_reasons) << ','
+        << candidate.spatial_transition_length_m << ','
+        << candidate.spatial_path_extent_m << ','
+        << candidate.spatial_completion_progress_m << ','
+        << candidate.spatial_minimum_road_margin_m << ','
+        << candidate.spatial_speed_upper_bound_mps << ','
+        << candidate.spatial_maximum_lateral_acceleration_mps2 << ','
+        << candidate.spatial_maximum_lateral_jerk_mps3 << ','
+        << static_cast<int>(candidate.st_evaluated) << ','
+        << CsvSafe(candidate.st_status) << ','
+        << static_cast<int>(candidate.st_prediction_evidence_complete) << ','
+        << static_cast<int>(candidate.st_corridor_empty) << ','
+        << candidate.st_first_evidence_failure_node << ','
+        << candidate.st_first_empty_node << ','
+        << candidate.st_minimum_width_m << ','
+        << candidate.st_minimum_width_node << ','
+        << static_cast<int>(
+               candidate.st_minimum_width_lower_source_present)
+        << ',' << candidate.st_minimum_width_lower_source_vehicle_id << ','
+        << static_cast<int>(
+               candidate.st_minimum_width_upper_source_present)
+        << ',' << candidate.st_minimum_width_upper_source_vehicle_id << ','
+        << static_cast<int>(candidate.st_first_empty_lower_source_present)
+        << ',' << candidate.st_first_empty_lower_source_vehicle_id << ','
+        << static_cast<int>(candidate.st_first_empty_upper_source_present)
+        << ',' << candidate.st_first_empty_upper_source_vehicle_id << ','
+        << static_cast<int>(candidate.st_curvature_initial_speed_feasible)
+        << ',' << candidate.st_minimum_speed_limit_mps << ','
+        << static_cast<int>(candidate.st_qp_attempted) << ','
+        << static_cast<int>(candidate.st_qp_success) << ','
+        << static_cast<int>(candidate.st_qp_bounds_satisfied) << ','
+        << CsvSafe(candidate.st_qp_status) << ','
+        << candidate.st_qp_objective << ','
+        << candidate.st_terminal_progress_m << ','
+        << candidate.st_terminal_speed_mps << ','
+        << static_cast<int>(candidate.st_source_lane_departed_in_time) << ','
+        << candidate.st_source_lane_departure_time_s << ','
+        << candidate.st_source_lane_departure_deadline_s << ','
+        << static_cast<int>(candidate.st_lane_change_completed_in_time) << ','
+        << candidate.st_lane_change_completion_time_s << ','
+        << candidate.st_lane_change_completion_deadline_s << ','
+        << candidate.st_minimum_lower_margin_m << ','
+        << candidate.st_minimum_upper_margin_m << ','
+        << candidate.st_maximum_speed_excess_mps << ','
+        << static_cast<int>(candidate.final_evaluated) << ','
+        << CsvSafe(candidate.final_status) << ','
+        << static_cast<int>(candidate.best_valid_candidate) << ','
+        << static_cast<int>(candidate.selected_for_dispatch) << ','
+        << static_cast<int>(candidate.tightening_attempted) << ','
+        << static_cast<int>(candidate.tightening_succeeded) << ','
+        << static_cast<int>(candidate.final_validation_valid) << ','
+        << CsvSafe(candidate.final_rejection_detail) << ','
+        << candidate.final_minimum_physical_margin_m << ','
+        << candidate.final_minimum_operational_margin_m << ','
+        << candidate.final_minimum_road_margin_m << ','
+        << candidate.final_maximum_acceleration_mps2 << ','
+        << candidate.final_maximum_jerk_mps3 << ','
+        << candidate.final_minimum_longitudinal_acceleration_mps2 << ','
+        << candidate.final_cost << '\n';
+  }
+}
+
+void PlannerRuntimeMonitor::WriteCollisionCsv(
+    const PlannerCycleDiagnostics &diagnostics) {
+  for (const ControlCandidateDiagnostics &candidate :
+       diagnostics.control_candidates) {
+    for (const CollisionEventDiagnostics &event :
+         candidate.collision_events) {
+      const CollisionEvidence &evidence = event.evidence;
+      collision_csv_
+          << session_id_ << ',' << diagnostics.cycle << ','
+          << candidate.candidate_id << ','
+          << LongitudinalSafetyPolicyName(candidate.safety_policy) << ','
+          << static_cast<int>(candidate.fallback_level) << ','
+          << static_cast<int>(candidate.minimum_risk_candidate) << ','
+          << static_cast<int>(candidate.selected_for_dispatch) << ','
+          << evidence.object_id << ','
+          << CollisionCheckKindName(evidence.check_kind) << ','
+          << evidence.point_index << ','
+          << evidence.time_from_telemetry_s << ','
+          << evidence.box_separation_m << ',' << evidence.overlap_m << ','
+          << static_cast<int>(evidence.retained_prefix) << ','
+          << static_cast<int>(evidence.stitch_boundary) << ','
+          << evidence.ego_x_m << ',' << evidence.ego_y_m << ','
+          << evidence.ego_road_s_m << ',' << evidence.ego_d_m << ','
+          << evidence.ego_speed_mps << ',' << evidence.obstacle_x_m << ','
+          << evidence.obstacle_y_m << ',' << evidence.obstacle_road_s_m << ','
+          << evidence.obstacle_d_m << ',' << evidence.obstacle_speed_mps << ','
+          << evidence.relative_road_s_m << ',' << evidence.relative_d_m << ','
+          << evidence.closing_speed_mps << ',' << evidence.center_distance_m
+          << ',' << evidence.observed_x_m << ',' << evidence.observed_y_m
+          << ',' << evidence.observed_road_s_m << ',' << evidence.observed_d_m
+          << ',' << evidence.observed_vx_mps << ',' << evidence.observed_vy_mps
+          << ',' << evidence.observed_speed_mps << ','
+          << evidence.observed_road_s_speed_mps << ','
+          << evidence.observed_d_rate_mps << ','
+          << static_cast<int>(event.qp_relevant) << ','
+          << (event.qp_relevant
+                  ? event.qp_initial_relative_s_m
+                  : std::numeric_limits<double>::quiet_NaN())
+          << ','
+          << (event.qp_relevant
+                  ? event.qp_predicted_speed_mps
+                  : std::numeric_limits<double>::quiet_NaN())
+          << ','
+          << (event.qp_relevant
+                  ? event.qp_obstacle_d_m
+                  : std::numeric_limits<double>::quiet_NaN())
+          << '\n';
+    }
+  }
+}
+
 void PlannerRuntimeMonitor::PrintSummary(
     const PlannerCycleDiagnostics &diagnostics) const {
   std::ostringstream line;
@@ -911,6 +1523,13 @@ void PlannerRuntimeMonitor::PrintSummary(
        << static_cast<int>(diagnostics.lateral.rolling_replanned) << '/'
        << diagnostics.lateral.rolling_replan_count
        << " obstacles=" << diagnostics.relevant_obstacle_count
+       << " shielded_same_lane_rear="
+       << diagnostics.shielded_same_lane_rear_vehicle_ids.size() << '['
+       << ObjectIdList(diagnostics.shielded_same_lane_rear_vehicle_ids) << ']'
+       << " disposition=" << static_cast<int>(diagnostics.plan_disposition)
+       << " fallback=" << static_cast<int>(diagnostics.fallback_level)
+       << " validation=" << static_cast<int>(diagnostics.validation_valid)
+       << " full_points=" << diagnostics.full_trajectory_points
        << " emergency=" << static_cast<int>(diagnostics.emergency)
        << " status=" << diagnostics.qp_status;
   std::cerr << line.str() << std::endl;
@@ -951,8 +1570,73 @@ void PlannerRuntimeMonitor::PrintViolation(
        << static_cast<int>(diagnostics.lateral.state_reset) << '/'
        << static_cast<int>(diagnostics.lateral.rolling_replanned) << '/'
        << diagnostics.lateral.rolling_replan_count
-       << " emergency=" << static_cast<int>(diagnostics.emergency);
+       << " emergency=" << static_cast<int>(diagnostics.emergency)
+       << " shielded_same_lane_rear="
+       << diagnostics.shielded_same_lane_rear_vehicle_ids.size() << '['
+       << ObjectIdList(diagnostics.shielded_same_lane_rear_vehicle_ids) << ']'
+       << " validator_collision_margin="
+       << diagnostics.validation_minimum_collision_margin_m;
+  if (diagnostics.has_first_collision_evidence) {
+    const CollisionEventDiagnostics &collision =
+        diagnostics.first_collision;
+    line << " first_collision(object/kind/index/t/overlap/rel_s/rel_d/"
+            "closing/qp/retained/stitch)="
+         << collision.evidence.object_id << '/'
+         << CollisionCheckKindName(collision.evidence.check_kind) << '/'
+         << collision.evidence.point_index << '/'
+         << collision.evidence.time_from_telemetry_s << '/'
+         << collision.evidence.overlap_m << '/'
+         << collision.evidence.relative_road_s_m << '/'
+         << collision.evidence.relative_d_m << '/'
+         << collision.evidence.closing_speed_mps << '/'
+         << static_cast<int>(collision.qp_relevant) << '/'
+         << static_cast<int>(collision.evidence.retained_prefix) << '/'
+         << static_cast<int>(collision.evidence.stitch_boundary);
+  }
   std::cerr << line.str() << std::endl;
+
+  for (const ControlCandidateDiagnostics &candidate :
+       diagnostics.control_candidates) {
+    std::ostringstream attempt;
+    attempt << std::fixed << std::setprecision(3)
+            << "[MONITOR][CONTROL_CANDIDATE] session=" << session_id_
+            << " cycle=" << diagnostics.cycle
+            << " id=" << candidate.candidate_id
+            << " policy="
+            << LongitudinalSafetyPolicyName(candidate.safety_policy)
+            << " fallback=" << static_cast<int>(candidate.fallback_level)
+            << " mrm=" << static_cast<int>(candidate.minimum_risk_candidate)
+            << " selected="
+            << static_cast<int>(candidate.selected_for_dispatch)
+            << " valid=" << static_cast<int>(candidate.validation_valid)
+            << " failure=" << candidate.failure_reason
+            << " qp=" << candidate.qp_status
+            << " qp_margin(physical/operational)="
+            << candidate.qp_minimum_physical_margin_m << '/'
+            << candidate.qp_minimum_operational_margin_m
+            << " validator_collision_margin="
+            << candidate.validation_minimum_collision_margin_m
+            << " shielded_same_lane_rear="
+            << candidate.shielded_same_lane_rear_vehicle_ids.size() << '['
+            << ObjectIdList(candidate.shielded_same_lane_rear_vehicle_ids)
+            << ']'
+            << " collisions=" << candidate.collision_events.size()
+            << " time(eval/validate)=" << candidate.evaluate_time_ms << '/'
+            << candidate.validate_time_ms;
+    if (!candidate.collision_events.empty()) {
+      const CollisionEventDiagnostics &event =
+          candidate.collision_events.front();
+      attempt << " first(object/kind/t/overlap/rel_s/rel_d/qp)="
+              << event.evidence.object_id << '/'
+              << CollisionCheckKindName(event.evidence.check_kind) << '/'
+              << event.evidence.time_from_telemetry_s << '/'
+              << event.evidence.overlap_m << '/'
+              << event.evidence.relative_road_s_m << '/'
+              << event.evidence.relative_d_m << '/'
+              << static_cast<int>(event.qp_relevant);
+    }
+    std::cerr << attempt.str() << std::endl;
+  }
 }
 
 void PlannerRuntimeMonitor::Record(const PlannerCycleDiagnostics &diagnostics) {
@@ -977,6 +1661,9 @@ void PlannerRuntimeMonitor::Record(const PlannerCycleDiagnostics &diagnostics) {
       diagnostics.cycle == 1 ||
       (config_.detail_csv_interval_cycles != 0 &&
        diagnostics.cycle % config_.detail_csv_interval_cycles == 0);
+  if (mask != 0U) {
+    last_control_violation_cycle_ = diagnostics.cycle;
+  }
 
   if (periodic_summary) {
     PrintSummary(diagnostics);
@@ -989,6 +1676,9 @@ void PlannerRuntimeMonitor::Record(const PlannerCycleDiagnostics &diagnostics) {
   EnsureCsvStreams();
   if (csv_available_) {
     WriteCycleCsv(diagnostics);
+    WriteControlCandidateCsv(diagnostics);
+    WriteBehaviorCandidateCsv(diagnostics);
+    WriteCollisionCsv(diagnostics);
     if (periodic_detail || report_violation) {
       WriteDetailCsv(diagnostics);
     }
@@ -996,6 +1686,9 @@ void PlannerRuntimeMonitor::Record(const PlannerCycleDiagnostics &diagnostics) {
       cycle_csv_.flush();
       point_csv_.flush();
       qp_csv_.flush();
+      control_candidate_csv_.flush();
+      behavior_candidate_csv_.flush();
+      collision_csv_.flush();
     }
   }
   previous_violation_mask_ = mask;

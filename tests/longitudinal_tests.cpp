@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -7,9 +10,11 @@
 
 #include "longitudinal_qp.h"
 #include "map.h"
+#include "path_stitcher.h"
 #include "qp_solver.h"
 #include "speed_reference.h"
 #include "traffic_predictor.h"
+#include "trajectory_assembler.h"
 #include "trajectory_sampler.h"
 
 namespace {
@@ -59,9 +64,50 @@ void TestQpSolverSmoke() {
   const QpSolverResult result = QpSolver().Solve(problem);
   Expect(result.success, "OSQP smoke problem should solve");
   if (result.success) {
+    Expect(std::isfinite(result.objective),
+           "successful OSQP result has a finite objective");
+    Expect(result.primal.allFinite(),
+           "successful OSQP result has a finite primal vector");
     ExpectNear(result.primal[0], 1.0, 1e-5,
                "OSQP smoke problem has the expected solution");
   }
+
+  Eigen::VectorXd invalid_warm_start(1);
+  invalid_warm_start[0] = std::numeric_limits<double>::quiet_NaN();
+  bool rejected_non_finite_warm_start = false;
+  try {
+    QpSolver().Solve(problem, &invalid_warm_start);
+  } catch (const std::invalid_argument &) {
+    rejected_non_finite_warm_start = true;
+  }
+  Expect(rejected_non_finite_warm_start,
+         "QP solver rejects a non-finite warm start before OSQP");
+}
+
+void TestCanonicalTrajectoryRejectsNonFiniteQpOutput() {
+  LongitudinalQpResult qp;
+  qp.success = true;
+  qp.hard_safe = true;
+  qp.trajectory.time_step_seconds = 0.1;
+  qp.trajectory.states.resize(2);
+  qp.trajectory.states[0].v = std::numeric_limits<double>::quiet_NaN();
+
+  TrajectoryCanonicalizationConfig config;
+  config.sample_time_step_s = 0.02;
+  config.sample_count = 1;
+  config.minimum_acceleration_mps2 = -5.0;
+  config.maximum_acceleration_mps2 = 3.0;
+  config.maximum_jerk_mps3 = 8.0;
+  config.invalid_trajectory_message = "non-finite test trajectory";
+
+  bool rejected = false;
+  try {
+    SampleCanonicalTrajectory(qp, config);
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  Expect(rejected,
+         "canonical trajectory assembly rejects non-finite QP output");
 }
 
 void CheckTrajectory(const LongitudinalTrajectory &trajectory,
@@ -157,6 +203,47 @@ void TestInitialJerkContinuityReference() {
   CheckTrajectory(continued.trajectory, config);
 }
 
+void TestCandidateNodeBounds() {
+  LongitudinalQpConfig config;
+  config.horizon_steps = 50;
+  config.maximum_speed_mps = 20.0;
+  LongitudinalQp optimizer(config);
+
+  LongitudinalQpInput input;
+  const std::size_t nodes = config.horizon_steps + 1;
+  input.reference_speed_mps.assign(nodes, 20.0);
+  input.minimum_progress_m.assign(nodes, 0.0);
+  input.maximum_progress_m.assign(nodes, 25.0);
+  input.maximum_speed_mps.assign(nodes, 8.0);
+  input.maximum_progress_m.front() = 0.0;
+  input.minimum_progress_m.back() = 5.0;
+  const LongitudinalQpResult bounded = optimizer.Solve(input);
+  Expect(bounded.success,
+         "candidate QP solves with per-node progress and speed bounds");
+  if (bounded.success) {
+    for (std::size_t k = 0; k < nodes; ++k) {
+      Expect(bounded.trajectory.states[k].s + 1e-3 >=
+                 input.minimum_progress_m[k] &&
+                 bounded.trajectory.states[k].s <=
+                     input.maximum_progress_m[k] + 1e-3 &&
+                 bounded.trajectory.states[k].v <=
+                     input.maximum_speed_mps[k] + 1e-3,
+             "public trajectory respects every candidate node bound");
+    }
+  }
+
+  LongitudinalQpInput malformed = input;
+  malformed.maximum_progress_m.pop_back();
+  bool rejected = false;
+  try {
+    (void)optimizer.Solve(malformed);
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  Expect(rejected,
+         "candidate bound vectors must match the complete QP horizon");
+}
+
 void TestLongitudinalHeadwayAndCollisionConstraints() {
   LongitudinalQpConfig config;
   config.horizon_steps = 80;
@@ -198,6 +285,12 @@ void TestLongitudinalHeadwayAndCollisionConstraints() {
   LongitudinalQpInput short_headway = input;
   short_headway.obstacles[0].relative_s = 10.0;
   short_headway.obstacles[0].speed_mps = 20.0;
+  const LongitudinalQpResult normal_short_headway =
+      optimizer.Solve(short_headway);
+  Expect(!normal_short_headway.success,
+         "normal policy keeps the operational headway boundary hard");
+  short_headway.safety_policy =
+      LongitudinalSafetyPolicy::kDegradedBraking;
   const LongitudinalQpResult short_headway_result =
       optimizer.Solve(short_headway);
   Expect(short_headway_result.success,
@@ -250,6 +343,14 @@ void TestEmergencyStopObjective() {
          "emergency objective brings the vehicle to a stop");
   Expect(result.trajectory.states.front().j < -0.5,
          "emergency objective begins braking immediately");
+  const std::vector<LongitudinalState> controller_samples =
+      SampleTrajectory(result.trajectory, 0.02, 400);
+  for (const LongitudinalState &state : controller_samples) {
+    Expect(state.v >= -1e-4,
+           "emergency trajectory stays nonnegative at controller samples");
+    Expect(state.v + config.stop_viability_time_seconds * state.a >= -1e-4,
+           "emergency trajectory recovers braking acceleration before stop");
+  }
 }
 
 void TestTrajectorySampler() {
@@ -368,6 +469,7 @@ void TestTrafficCorridorAndCurvedRoadDistance() {
   qp_input.initial_speed_mps = 20.0;
   qp_input.reference_speed_mps.assign(qp_config.horizon_steps + 1, 20.0);
   qp_input.obstacles = predicted;
+  qp_input.safety_policy = LongitudinalSafetyPolicy::kDegradedBraking;
   const LongitudinalQpResult result = LongitudinalQp(qp_config).Solve(qp_input);
   Expect(result.success,
          "physical gap below the desired headway remains QP-feasible");
@@ -385,6 +487,58 @@ void TestTrafficCorridorAndCurvedRoadDistance() {
              "curved-road body-collision boundary stays hard");
     }
   }
+}
+
+void TestFixedPathDefersTargetLaneHardCollisionActivation() {
+  const MapData map = LoadMap("data/highway_map.csv");
+  PlannerInput input;
+  input.ego.s = 100.0;
+  input.ego.d = 6.0;
+  input.ego.speed_mph = 20.0 / 0.44704;
+  input.end_path_s = input.ego.s;
+  input.end_path_d = input.ego.d;
+  const RoadGeometrySample ego_geometry =
+      EvaluateRoadGeometry(input.ego.s, input.ego.d, map);
+  input.ego.x = ego_geometry.x;
+  input.ego.y = ego_geometry.y;
+  input.ego.yaw_deg =
+      std::atan2(ego_geometry.first_derivative_y,
+                 ego_geometry.first_derivative_x) *
+      180.0 / 3.14159265358979323846;
+
+  DetectedVehicle target_lane_vehicle;
+  target_lane_vehicle.id = 43.0;
+  target_lane_vehicle.s = 120.0;
+  target_lane_vehicle.d = 2.0;
+  SetFrenetVelocity(&target_lane_vehicle, 20.0, 0.0, map);
+  input.traffic.push_back(target_lane_vehicle);
+
+  TrafficPredictionConfig prediction_config;
+  prediction_config.maximum_speed_mps = 20.0;
+  const FixedSpatialPath fixed_path = PathStitcher().Prepare(
+      input, input.ego.s, input.ego.d, 2.0,
+      prediction_config.maximum_speed_mps, map, PathStitcherState(), {},
+      false);
+  const std::vector<PredictedObstacle> predicted = PredictRelevantTraffic(
+      input, input.ego.s, input.ego.d, 2.0, map, prediction_config,
+      &fixed_path);
+  Expect(predicted.size() == 1 &&
+             predicted.front().hard_collision_active.size() == 81,
+         "fixed-path target-lane traffic remains available at every QP node");
+  if (predicted.size() != 1 ||
+      predicted.front().hard_collision_active.size() != 81) {
+    return;
+  }
+  const std::vector<unsigned char> &active =
+      predicted.front().hard_collision_active;
+  Expect(active.front() == 0U,
+         "a laterally separated target-lane object is not hard at node zero");
+  Expect(active.back() != 0U,
+         "the same object becomes hard when the fixed path reaches its lane");
+  const auto first_active =
+      std::find(active.begin(), active.end(), static_cast<unsigned char>(1U));
+  Expect(first_active != active.begin() && first_active != active.end(),
+         "hard activation has a nontrivial fixed-path handoff node");
 }
 
 void TestAdjacentIntrusionSpeedLimits() {
@@ -538,6 +692,7 @@ void TestAdjacentIntrusionSpeedLimits() {
   qp_input.initial_speed_mps = 20.0;
   qp_input.reference_speed_mps.assign(31, 20.0);
   qp_input.obstacles.push_back(timed_collision);
+  qp_input.safety_policy = LongitudinalSafetyPolicy::kDegradedBraking;
   const LongitudinalQpResult timed_result =
       LongitudinalQp(qp_config).Solve(qp_input);
   Expect(timed_result.success,
@@ -693,14 +848,17 @@ void TestGapClosingSpeedReference() {
 
 int main() {
   TestQpSolverSmoke();
+  TestCanonicalTrajectoryRejectsNonFiniteQpOutput();
   TestLongitudinalAcceleration();
   TestLongitudinalDeceleration();
   TestInitialJerkContinuityReference();
+  TestCandidateNodeBounds();
   TestLongitudinalHeadwayAndCollisionConstraints();
   TestEmergencyStopObjective();
   TestTrajectorySampler();
   TestTrafficPrediction();
   TestTrafficCorridorAndCurvedRoadDistance();
+  TestFixedPathDefersTargetLaneHardCollisionActivation();
   TestAdjacentIntrusionSpeedLimits();
   TestMonotoneSpeedReference();
   TestGapClosingSpeedReference();

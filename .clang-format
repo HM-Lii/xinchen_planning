@@ -1,0 +1,12 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: Cpp11
+ColumnLimit: 80
+IndentWidth: 2
+ContinuationIndentWidth: 4
+PointerAlignment: Right
+DerivePointerAlignment: false
+SortIncludes: false
+AllowShortFunctionsOnASingleLine: Inline
+...

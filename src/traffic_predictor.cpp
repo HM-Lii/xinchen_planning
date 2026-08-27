@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "map.h"
+#include "path_stitcher.h"
 
 namespace {
 
@@ -102,10 +103,13 @@ std::vector<PredictedObstacle>
 PredictRelevantTraffic(const PlannerInput &input, double plan_start_s,
                        double plan_start_d, double lane_center_d,
                        const MapData &map,
-                       const TrafficPredictionConfig &config) {
+                       const TrafficPredictionConfig &config,
+                       const FixedSpatialPath *fixed_path) {
   if (!std::isfinite(plan_start_s) || !std::isfinite(plan_start_d) ||
       !std::isfinite(lane_center_d) ||
       config.simulator_time_step_seconds <= 0.0 ||
+      !std::isfinite(config.qp_time_step_seconds) ||
+      config.qp_time_step_seconds <= 0.0 ||
       config.horizon_steps == 0 ||
       !std::isfinite(config.maximum_speed_mps) ||
       config.maximum_speed_mps <= 0.0 ||
@@ -125,14 +129,43 @@ PredictRelevantTraffic(const PlannerInput &input, double plan_start_s,
   const double lateral_clearance =
       0.5 * (config.ego_width_meters + config.obstacle_width_meters) +
       config.lane_boundary_margin_meters;
-  const double hard_corridor_min = lateral_corridor_min - lateral_clearance;
-  const double hard_corridor_max = lateral_corridor_max + lateral_clearance;
+  const double full_hard_corridor_min =
+      lateral_corridor_min - lateral_clearance;
+  const double full_hard_corridor_max =
+      lateral_corridor_max + lateral_clearance;
   const double lane_boundary_min =
       lane_center_d - 0.5 * config.lane_width_meters;
   const double lane_boundary_max =
       lane_center_d + 0.5 * config.lane_width_meters;
   const double obstacle_half_width = 0.5 * config.obstacle_width_meters;
   const std::size_t nodes = config.horizon_steps + 1;
+  std::vector<double> hard_corridor_min(nodes, full_hard_corridor_min);
+  std::vector<double> hard_corridor_max(nodes, full_hard_corridor_max);
+  if (fixed_path != nullptr) {
+    std::vector<LongitudinalState> maximum_progress_states(nodes);
+    for (std::size_t node = 0; node < nodes; ++node) {
+      maximum_progress_states[node].s =
+          config.maximum_speed_mps * config.qp_time_step_seconds *
+          static_cast<double>(node);
+    }
+    const StitchedRoadPathResult maximum_progress_path =
+        PathStitcher().Sample(*fixed_path, maximum_progress_states, map);
+    const std::size_t new_state_offset = fixed_path->retained_states.size();
+    if (maximum_progress_path.output_states.size() !=
+        new_state_offset + nodes) {
+      throw std::logic_error(
+          "traffic lateral reachability path has the wrong size");
+    }
+    for (std::size_t node = 0; node < nodes; ++node) {
+      const double reachable_d =
+          maximum_progress_path.output_states[new_state_offset + node]
+              .planned_d;
+      hard_corridor_min[node] =
+          std::min(plan_start_d, reachable_d) - lateral_clearance;
+      hard_corridor_max[node] =
+          std::max(plan_start_d, reachable_d) + lateral_clearance;
+    }
+  }
 
   std::vector<PredictedObstacle> predicted;
   predicted.reserve(input.traffic.size());
@@ -146,15 +179,24 @@ PredictRelevantTraffic(const PlannerInput &input, double plan_start_s,
     if (!std::isfinite(speed)) {
       throw std::invalid_argument("traffic speed prediction is non-finite");
     }
-    // Model every relevant vehicle in the target-lane arc-length coordinate.
-    // This keeps the Frenet projection, physical obstacle speed and the ego
-    // QP's Cartesian path distance in one meter-based longitudinal frame.
+    // Use target-lane arc length for the inexpensive lookahead filter, then
+    // project relevant RoadS positions onto the already fixed spatial path so
+    // obstacle and ego QP progress share the same physical coordinate.
     const double projected_s = AdvanceRoadParameter(
         vehicle.s, speed * prediction_delay, lane_center_d, map);
-    const double relative_s = ForwardLaneArcDistance(
+    const double lane_relative_s = ForwardLaneArcDistance(
         plan_start_s, projected_s, lane_center_d,
         config.lookahead_distance_meters, map);
-    if (relative_s > config.lookahead_distance_meters) {
+    if (lane_relative_s > config.lookahead_distance_meters) {
+      continue;
+    }
+    const double relative_s =
+        fixed_path == nullptr
+            ? lane_relative_s
+            : FixedPathProgressToRoadParameterDistance(*fixed_path,
+                                                       projected_s, map);
+    if (!std::isfinite(relative_s) ||
+        relative_s > config.lookahead_distance_meters) {
       continue;
     }
 
@@ -164,14 +206,18 @@ PredictRelevantTraffic(const PlannerInput &input, double plan_start_s,
     obstacle.speed_mps = speed;
     obstacle.d = vehicle.d;
 
-    // Lateral relevance is a current-frame geometric decision. Do not project
-    // an adjacent vehicle's contour with measured lateral velocity: a vehicle
-    // that has not crossed the lane line in the current sensor frame must not
-    // create a future intrusion cap or hard-collision activation.
-    const bool hard_collision_active =
-        vehicle.d >= hard_corridor_min && vehicle.d <= hard_corridor_max;
-    obstacle.hard_collision_active.assign(
-        nodes, hard_collision_active ? 1U : 0U);
+    // The obstacle contour remains a current-frame geometric observation; its
+    // measured lateral velocity is not extrapolated. The ego hard corridor,
+    // however, grows per QP node along the fixed spatial path, preventing a
+    // separated target-lane object from becoming hard-active at node zero.
+    obstacle.hard_collision_active.resize(nodes, 0U);
+    bool any_hard_collision_active = false;
+    for (std::size_t node = 0; node < nodes; ++node) {
+      const bool active = vehicle.d >= hard_corridor_min[node] &&
+                          vehicle.d <= hard_corridor_max[node];
+      obstacle.hard_collision_active[node] = active ? 1U : 0U;
+      any_hard_collision_active = any_hard_collision_active || active;
+    }
 
     // Vehicles already centered inside the target lane use the ordinary
     // longitudinal following model without an intrusion-specific speed cap.
@@ -183,9 +229,10 @@ PredictRelevantTraffic(const PlannerInput &input, double plan_start_s,
     }
     const double hard_intrusion_depth =
         intrusion_side < 0
-            ? hard_corridor_min + obstacle_half_width - lane_boundary_min
+            ? full_hard_corridor_min + obstacle_half_width -
+                  lane_boundary_min
             : lane_boundary_max -
-                  (hard_corridor_max - obstacle_half_width);
+                  (full_hard_corridor_max - obstacle_half_width);
     bool any_intrusion_speed_limit = false;
     if (intrusion_side != 0) {
       const double intrusion_depth =
@@ -193,16 +240,23 @@ PredictRelevantTraffic(const PlannerInput &input, double plan_start_s,
               ? vehicle.d + obstacle_half_width - lane_boundary_min
               : lane_boundary_max -
                     (vehicle.d - obstacle_half_width);
-      const double speed_limit =
-          IntrusionSpeedLimit(intrusion_depth, hard_intrusion_depth,
-                              hard_collision_active, speed, config);
-      any_intrusion_speed_limit =
-          speed_limit < config.maximum_speed_mps - kSpeedLimitToleranceMps;
-      if (any_intrusion_speed_limit) {
-        obstacle.intrusion_speed_limit_mps.assign(nodes, speed_limit);
+      obstacle.intrusion_speed_limit_mps.resize(
+          nodes, config.maximum_speed_mps);
+      for (std::size_t node = 0; node < nodes; ++node) {
+        const double speed_limit = IntrusionSpeedLimit(
+            intrusion_depth, hard_intrusion_depth,
+            obstacle.hard_collision_active[node] != 0U, speed, config);
+        obstacle.intrusion_speed_limit_mps[node] = speed_limit;
+        any_intrusion_speed_limit =
+            any_intrusion_speed_limit ||
+            speed_limit <
+                config.maximum_speed_mps - kSpeedLimitToleranceMps;
+      }
+      if (!any_intrusion_speed_limit) {
+        obstacle.intrusion_speed_limit_mps.clear();
       }
     }
-    if (!hard_collision_active && !any_intrusion_speed_limit) {
+    if (!any_hard_collision_active && !any_intrusion_speed_limit) {
       continue;
     }
     predicted.push_back(obstacle);

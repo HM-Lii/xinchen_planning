@@ -1542,7 +1542,7 @@ Trajectory Plan(const Telemetry& input) {
 
 ---
 
-## 21. 测试与验收建议
+## 21. 测试建议
 
 至少覆盖以下场景：
 

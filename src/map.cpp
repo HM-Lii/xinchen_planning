@@ -13,6 +13,7 @@ namespace {
 
 constexpr double kMinimumRoadTangentLength = 1e-8;
 constexpr double kArcLengthIntegrationParameterStep = 0.2;
+constexpr std::size_t kMaximumRoadArcLengthIndexEntries = 1000000;
 
 double Distance(double x1, double y1, double x2, double y2) {
   return std::hypot(x2 - x1, y2 - y1);
@@ -262,34 +263,31 @@ double NormalizeS(double s, double track_length) {
   return wrapped;
 }
 
-RoadGeometrySample EvaluateRoadGeometry(double s, double d,
-                                        const MapData &map) {
-  std::string error;
-  if (!ValidateMap(map, &error)) {
-    throw std::invalid_argument("invalid map: " + error);
-  }
+RoadGeometrySample EvaluateRoadGeometryOnValidatedMap(double s, double d,
+                                                       const MapData &map) {
   if (!std::isfinite(d)) {
     throw std::invalid_argument("Frenet d must be finite");
   }
 
+  const bool has_prepared_splines = HasPreparedSplines(map);
   std::vector<double> x_second;
   std::vector<double> y_second;
   std::vector<double> dx_second;
   std::vector<double> dy_second;
-  if (!HasPreparedSplines(map)) {
+  if (!has_prepared_splines) {
     x_second = PeriodicSecondDerivatives(map.x, map.s, map.track_length);
     y_second = PeriodicSecondDerivatives(map.y, map.s, map.track_length);
     dx_second = PeriodicSecondDerivatives(map.dx, map.s, map.track_length);
     dy_second = PeriodicSecondDerivatives(map.dy, map.s, map.track_length);
   }
   const std::vector<double> &prepared_x =
-      HasPreparedSplines(map) ? map.spline_x_second : x_second;
+      has_prepared_splines ? map.spline_x_second : x_second;
   const std::vector<double> &prepared_y =
-      HasPreparedSplines(map) ? map.spline_y_second : y_second;
+      has_prepared_splines ? map.spline_y_second : y_second;
   const std::vector<double> &prepared_dx =
-      HasPreparedSplines(map) ? map.spline_dx_second : dx_second;
+      has_prepared_splines ? map.spline_dx_second : dx_second;
   const std::vector<double> &prepared_dy =
-      HasPreparedSplines(map) ? map.spline_dy_second : dy_second;
+      has_prepared_splines ? map.spline_dy_second : dy_second;
 
   const double wrapped_s = NormalizeS(s, map.track_length);
   const SplineValue center_x = EvaluatePeriodicSpline(
@@ -315,14 +313,62 @@ RoadGeometrySample EvaluateRoadGeometry(double s, double d,
   return result;
 }
 
-double RoadParameterMetric(double s, double d, const MapData &map) {
-  const RoadGeometrySample geometry = EvaluateRoadGeometry(s, d, map);
+RoadGeometrySample EvaluateRoadGeometry(double s, double d,
+                                        const MapData &map) {
+  std::string error;
+  if (!ValidateMap(map, &error)) {
+    throw std::invalid_argument("invalid map: " + error);
+  }
+  return EvaluateRoadGeometryOnValidatedMap(s, d, map);
+}
+
+namespace {
+
+void RequireValidMap(const MapData &map) {
+  std::string error;
+  if (!ValidateMap(map, &error)) {
+    throw std::invalid_argument("invalid map: " + error);
+  }
+}
+
+double RoadParameterMetricOnValidatedMap(double s, double d,
+                                         const MapData &map) {
+  const RoadGeometrySample geometry =
+      EvaluateRoadGeometryOnValidatedMap(s, d, map);
   const double magnitude =
       std::hypot(geometry.first_derivative_x, geometry.first_derivative_y);
   if (!std::isfinite(magnitude) || magnitude <= kMinimumRoadTangentLength) {
     throw std::runtime_error("road spline has a degenerate tangent");
   }
   return magnitude;
+}
+
+double RoadArcLengthOnValidatedMap(double start_s, double parameter_distance,
+                                   double d, const MapData &map) {
+  std::size_t intervals = static_cast<std::size_t>(
+      std::ceil(parameter_distance / kArcLengthIntegrationParameterStep));
+  intervals = std::max<std::size_t>(2, intervals);
+  if (intervals % 2 != 0) {
+    ++intervals;
+  }
+  const double step = parameter_distance / static_cast<double>(intervals);
+  double weighted_sum = RoadParameterMetricOnValidatedMap(start_s, d, map) +
+                        RoadParameterMetricOnValidatedMap(
+                            start_s + parameter_distance, d, map);
+  for (std::size_t index = 1; index < intervals; ++index) {
+    const double weight = index % 2 == 0 ? 2.0 : 4.0;
+    weighted_sum +=
+        weight * RoadParameterMetricOnValidatedMap(
+                     start_s + static_cast<double>(index) * step, d, map);
+  }
+  return weighted_sum * step / 3.0;
+}
+
+} // namespace
+
+double RoadParameterMetric(double s, double d, const MapData &map) {
+  RequireValidMap(map);
+  return RoadParameterMetricOnValidatedMap(s, d, map);
 }
 
 double RoadArcLength(double start_s, double parameter_distance, double d,
@@ -334,24 +380,8 @@ double RoadArcLength(double start_s, double parameter_distance, double d,
   if (parameter_distance <= 0.0) {
     return 0.0;
   }
-
-  std::size_t intervals = static_cast<std::size_t>(
-      std::ceil(parameter_distance / kArcLengthIntegrationParameterStep));
-  intervals = std::max<std::size_t>(2, intervals);
-  if (intervals % 2 != 0) {
-    ++intervals;
-  }
-  const double step = parameter_distance / static_cast<double>(intervals);
-  double weighted_sum = RoadParameterMetric(start_s, d, map) +
-                        RoadParameterMetric(start_s + parameter_distance, d,
-                                            map);
-  for (std::size_t index = 1; index < intervals; ++index) {
-    const double weight = index % 2 == 0 ? 2.0 : 4.0;
-    weighted_sum +=
-        weight * RoadParameterMetric(
-                     start_s + static_cast<double>(index) * step, d, map);
-  }
-  return weighted_sum * step / 3.0;
+  RequireValidMap(map);
+  return RoadArcLengthOnValidatedMap(start_s, parameter_distance, d, map);
 }
 
 double AdvanceRoadParameter(double start_s, double distance_meters, double d,
@@ -364,22 +394,218 @@ double AdvanceRoadParameter(double start_s, double distance_meters, double d,
     return start_s;
   }
 
+  RequireValidMap(map);
   double parameter_distance =
-      distance_meters / RoadParameterMetric(start_s, d, map);
+      distance_meters / RoadParameterMetricOnValidatedMap(start_s, d, map);
   parameter_distance = std::max(parameter_distance, 1e-9);
   for (int iteration = 0; iteration < 6; ++iteration) {
-    const double measured_distance =
-        RoadArcLength(start_s, parameter_distance, d, map);
+    const double measured_distance = RoadArcLengthOnValidatedMap(
+        start_s, parameter_distance, d, map);
     const double error = measured_distance - distance_meters;
     if (std::fabs(error) <= 1e-9) {
       break;
     }
-    const double end_metric =
-        RoadParameterMetric(start_s + parameter_distance, d, map);
+    const double end_metric = RoadParameterMetricOnValidatedMap(
+        start_s + parameter_distance, d, map);
     parameter_distance -= error / end_metric;
     parameter_distance = std::max(parameter_distance, 1e-9);
   }
   return start_s + parameter_distance;
+}
+
+RoadArcLengthIndex BuildRoadArcLengthIndexOnValidatedMap(
+    double start_s, double maximum_distance_meters, double d,
+    const MapData &map) {
+  if (!std::isfinite(start_s) || !std::isfinite(maximum_distance_meters) ||
+      !std::isfinite(d) || maximum_distance_meters < 0.0) {
+    throw std::invalid_argument("invalid road arc-length index input");
+  }
+
+  RoadArcLengthIndex index;
+  index.start_road_parameter_s = start_s;
+  index.lateral_offset_m = d;
+  index.road_parameter_s.push_back(start_s);
+  index.cumulative_arc_length_m.push_back(0.0);
+  index.parameter_metric.push_back(
+      RoadParameterMetricOnValidatedMap(start_s, d, map));
+  index.interval_midpoint_metric.push_back(0.0);
+
+  while (index.cumulative_arc_length_m.back() + 1e-12 <
+         maximum_distance_meters) {
+    if (index.road_parameter_s.size() >=
+        kMaximumRoadArcLengthIndexEntries) {
+      throw std::runtime_error("road arc-length index exceeded its bound");
+    }
+    const double lower_s = index.road_parameter_s.back();
+    const double midpoint_s =
+        lower_s + 0.5 * kArcLengthIntegrationParameterStep;
+    const double upper_s = lower_s + kArcLengthIntegrationParameterStep;
+    const double midpoint_metric =
+        RoadParameterMetricOnValidatedMap(midpoint_s, d, map);
+    const double upper_metric =
+        RoadParameterMetricOnValidatedMap(upper_s, d, map);
+    const double interval_length =
+        kArcLengthIntegrationParameterStep *
+        (index.parameter_metric.back() + 4.0 * midpoint_metric +
+         upper_metric) /
+        6.0;
+    if (!std::isfinite(interval_length) || interval_length <= 0.0) {
+      throw std::runtime_error("road arc-length index is not monotonic");
+    }
+    index.road_parameter_s.push_back(upper_s);
+    index.cumulative_arc_length_m.push_back(
+        index.cumulative_arc_length_m.back() + interval_length);
+    index.parameter_metric.push_back(upper_metric);
+    index.interval_midpoint_metric.push_back(midpoint_metric);
+  }
+  return index;
+}
+
+RoadArcLengthIndex BuildRoadArcLengthIndex(double start_s,
+                                           double maximum_distance_meters,
+                                           double d, const MapData &map) {
+  RequireValidMap(map);
+  return BuildRoadArcLengthIndexOnValidatedMap(
+      start_s, maximum_distance_meters, d, map);
+}
+
+double RoadParameterAtArcLength(const RoadArcLengthIndex &index,
+                                double distance_meters) {
+  const std::size_t size = index.road_parameter_s.size();
+  if (!std::isfinite(distance_meters) || distance_meters < 0.0 || size == 0 ||
+      index.cumulative_arc_length_m.size() != size ||
+      index.parameter_metric.size() != size ||
+      index.interval_midpoint_metric.size() != size) {
+    throw std::invalid_argument("invalid road arc-length lookup");
+  }
+  const double maximum_distance = index.cumulative_arc_length_m.back();
+  if (distance_meters > maximum_distance + 1e-9) {
+    throw std::out_of_range("road arc-length lookup exceeds index coverage");
+  }
+  const double target = std::min(distance_meters, maximum_distance);
+  const auto upper = std::lower_bound(index.cumulative_arc_length_m.begin(),
+                                      index.cumulative_arc_length_m.end(),
+                                      target);
+  if (upper == index.cumulative_arc_length_m.begin()) {
+    return index.road_parameter_s.front();
+  }
+  if (upper == index.cumulative_arc_length_m.end()) {
+    return index.road_parameter_s.back();
+  }
+
+  const std::size_t upper_index = static_cast<std::size_t>(
+      upper - index.cumulative_arc_length_m.begin());
+  const std::size_t lower_index = upper_index - 1;
+  const double arc_offset =
+      target - index.cumulative_arc_length_m[lower_index];
+  const double interval_arc_length =
+      index.cumulative_arc_length_m[upper_index] -
+      index.cumulative_arc_length_m[lower_index];
+  const double parameter_step = index.road_parameter_s[upper_index] -
+                                index.road_parameter_s[lower_index];
+  const double lower_metric = index.parameter_metric[lower_index];
+  const double midpoint_metric =
+      index.interval_midpoint_metric[upper_index];
+  const double upper_metric = index.parameter_metric[upper_index];
+  const double quadratic =
+      2.0 * (lower_metric + upper_metric - 2.0 * midpoint_metric);
+  const double linear =
+      4.0 * midpoint_metric - 3.0 * lower_metric - upper_metric;
+  double u = arc_offset / interval_arc_length;
+  u = std::max(0.0, std::min(1.0, u));
+  for (int iteration = 0; iteration < 6; ++iteration) {
+    const double integral =
+        parameter_step *
+        (quadratic * u * u * u / 3.0 + linear * u * u / 2.0 +
+         lower_metric * u);
+    const double derivative =
+        parameter_step *
+        (quadratic * u * u + linear * u + lower_metric);
+    if (!std::isfinite(derivative) ||
+        std::fabs(derivative) <= kMinimumRoadTangentLength) {
+      break;
+    }
+    u = std::max(0.0,
+                 std::min(1.0, u - (integral - arc_offset) / derivative));
+  }
+  return index.road_parameter_s[lower_index] + u * parameter_step;
+}
+
+RoadProjection ProjectCartesianToRoad(double x, double y,
+                                      double initial_road_s_unwrapped_m,
+                                      const MapData &map) {
+  if (!std::isfinite(x) || !std::isfinite(y) ||
+      !std::isfinite(initial_road_s_unwrapped_m)) {
+    throw std::invalid_argument("invalid Cartesian road projection input");
+  }
+  std::string map_error;
+  if (!ValidateMap(map, &map_error)) {
+    throw std::invalid_argument("invalid map: " + map_error);
+  }
+
+  double road_s = initial_road_s_unwrapped_m;
+  double d = 0.0;
+  for (int iteration = 0; iteration < 16; ++iteration) {
+    const RoadGeometrySample center =
+        EvaluateRoadGeometryOnValidatedMap(road_s, 0.0, map);
+    const RoadGeometrySample unit_offset =
+        EvaluateRoadGeometryOnValidatedMap(road_s, 1.0, map);
+    const double normal_x = unit_offset.x - center.x;
+    const double normal_y = unit_offset.y - center.y;
+    const double normal_squared = normal_x * normal_x + normal_y * normal_y;
+    if (!std::isfinite(normal_squared) || normal_squared <= 1e-12) {
+      throw std::runtime_error("road projection normal is degenerate");
+    }
+    d = ((x - center.x) * normal_x + (y - center.y) * normal_y) /
+        normal_squared;
+
+    const RoadGeometrySample road =
+        EvaluateRoadGeometryOnValidatedMap(road_s, d, map);
+    const double residual_x = road.x - x;
+    const double residual_y = road.y - y;
+    const double first = residual_x * road.first_derivative_x +
+                         residual_y * road.first_derivative_y;
+    const double second =
+        road.first_derivative_x * road.first_derivative_x +
+        road.first_derivative_y * road.first_derivative_y +
+        residual_x * road.second_derivative_x +
+        residual_y * road.second_derivative_y;
+    if (!std::isfinite(second) || std::fabs(second) <= 1e-12) {
+      break;
+    }
+    double step = first / second;
+    const double maximum_step = 0.05 * map.track_length;
+    step = std::max(-maximum_step, std::min(step, maximum_step));
+    road_s -= step;
+    if (std::fabs(step) <= 1e-10) {
+      break;
+    }
+  }
+
+  const RoadGeometrySample center =
+      EvaluateRoadGeometryOnValidatedMap(road_s, 0.0, map);
+  const RoadGeometrySample unit_offset =
+      EvaluateRoadGeometryOnValidatedMap(road_s, 1.0, map);
+  const double normal_x = unit_offset.x - center.x;
+  const double normal_y = unit_offset.y - center.y;
+  const double normal_squared = normal_x * normal_x + normal_y * normal_y;
+  if (!std::isfinite(normal_squared) || normal_squared <= 1e-12) {
+    throw std::runtime_error("road projection normal is degenerate");
+  }
+  d = ((x - center.x) * normal_x + (y - center.y) * normal_y) /
+      normal_squared;
+  const RoadGeometrySample projected =
+      EvaluateRoadGeometryOnValidatedMap(road_s, d, map);
+
+  RoadProjection result;
+  result.road_s_unwrapped_m = road_s;
+  result.d_m = d;
+  result.residual_m = std::hypot(projected.x - x, projected.y - y);
+  if (!std::isfinite(result.road_s_unwrapped_m) ||
+      !std::isfinite(result.d_m) || !std::isfinite(result.residual_m)) {
+    throw std::runtime_error("road projection produced a non-finite result");
+  }
+  return result;
 }
 
 std::pair<double, double> FrenetToCartesian(double s, double d,

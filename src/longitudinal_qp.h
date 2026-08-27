@@ -12,6 +12,15 @@ public:
       const LongitudinalQpConfig &config = LongitudinalQpConfig());
 
   LongitudinalQpResult Solve(const LongitudinalQpInput &input);
+  LongitudinalQpResult Evaluate(const LongitudinalQpInput &input,
+                                const QpWarmStartState &warm_start) const;
+  LongitudinalQpResult Evaluate(
+      const LongitudinalQpInput &input,
+      const QpWarmStartState &warm_start,
+      const QpSolverOptions &solver_options) const;
+  void CommitWarmStart(const LongitudinalQpResult &result);
+  void ResetWarmStart();
+  QpWarmStartState warm_start() const;
 
 private:
   LongitudinalQpConfig config_;

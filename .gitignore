@@ -32,6 +32,10 @@ coverage/
 /logs/
 /.deps/
 
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
 # Editor and OS metadata
 .vscode/
 .idea/

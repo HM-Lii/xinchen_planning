@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -29,6 +30,10 @@ void ExpectNear(double actual, double expected, double tolerance,
 }
 
 void RunTest(void (*test)(), const std::string &name) {
+  const char *filter = std::getenv("PLANNING_TEST_FILTER");
+  if (filter != nullptr && name != filter) {
+    return;
+  }
   try {
     test();
   } catch (const std::exception &error) {
@@ -211,6 +216,43 @@ void TestHighwayMapSplineContinuity() {
          "periodic road spline has continuous waypoint curvature");
 }
 
+void TestRoadArcLengthIndexRoundTrip() {
+  const MapData map = LoadMap("data/highway_map.csv");
+  const double starts[] = {100.0, map.track_length - 20.0};
+  const double offsets[] = {2.0, 6.0, 10.0};
+  const double distances[] = {0.0, 0.1, 1.0, 12.0, 80.0, 160.0};
+  double maximum_error = 0.0;
+  for (double start_s : starts) {
+    for (double d : offsets) {
+      const RoadArcLengthIndex index =
+          BuildRoadArcLengthIndex(start_s, 160.0, d, map);
+      for (double distance : distances) {
+        const double road_s = RoadParameterAtArcLength(index, distance);
+        const double recovered =
+            RoadArcLength(start_s, road_s - start_s, d, map);
+        maximum_error =
+            std::max(maximum_error, std::fabs(recovered - distance));
+      }
+    }
+  }
+  Expect(maximum_error < 1e-5,
+         "road arc-length inverse stays within 10 micrometers across lanes "
+         "and wrap: error=" +
+             std::to_string(maximum_error));
+
+  const RoadArcLengthIndex bounded =
+      BuildRoadArcLengthIndex(100.0, 10.0, 6.0, map);
+  bool rejected_out_of_range = false;
+  try {
+    (void)RoadParameterAtArcLength(
+        bounded, bounded.cumulative_arc_length_m.back() + 0.1);
+  } catch (const std::out_of_range &) {
+    rejected_out_of_range = true;
+  }
+  Expect(rejected_out_of_range,
+         "road arc-length inverse rejects distances beyond its coverage");
+}
+
 std::string ValidTelemetryMessage() {
   return "42[\"telemetry\",{\"x\":0,\"y\":-6,\"s\":0,\"d\":6,"
          "\"yaw\":0,\"speed\":0,\"previous_path_x\":[],"
@@ -359,6 +401,12 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
   const std::string cycle_path = directory + "/planner_cycle.csv";
   const std::string point_path = directory + "/planner_points.csv";
   const std::string qp_path = directory + "/planner_qp.csv";
+  const std::string control_candidate_path =
+      directory + "/planner_control_candidates.csv";
+  const std::string behavior_candidate_path =
+      directory + "/planner_behavior_candidates.csv";
+  const std::string collision_path =
+      directory + "/planner_collision_events.csv";
 
   PlannerMonitorConfig config;
   config.enabled = true;
@@ -380,12 +428,87 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
     second.cycle = 2;
     second.cartesian_samples.push_back(CartesianKinematicSample());
     second.qp_samples.push_back(QpNodeMonitorSample());
+    ControlCandidateDiagnostics control_candidate;
+    control_candidate.candidate_id = 21;
+    control_candidate.has_plan = true;
+    control_candidate.failure_reason = "HardValidation";
+    control_candidate.shielded_same_lane_rear_vehicle_ids = {7.0, 8.0};
+    CollisionEventDiagnostics collision;
+    collision.evidence.object_id = 99.0;
+    collision.evidence.check_kind = CollisionCheckKind::kSweptInterval;
+    collision.evidence.point_index = 7;
+    collision.evidence.time_from_telemetry_s = 0.15;
+    collision.evidence.box_separation_m = -0.2;
+    collision.evidence.overlap_m = 0.2;
+    collision.evidence.relative_road_s_m = 0.1;
+    collision.evidence.relative_d_m = -0.1;
+    collision.qp_relevant = false;
+    control_candidate.collision_events.push_back(collision);
+    second.control_candidates.push_back(control_candidate);
+    BehaviorCandidateDiagnostics behavior_candidate;
+    behavior_candidate.candidate_id = 31;
+    behavior_candidate.behavior = "ChangeLeft";
+    behavior_candidate.source_lane = 1;
+    behavior_candidate.target_lane = 0;
+    behavior_candidate.behavior_status = "CoarseAdmissionRejected";
+    behavior_candidate.admission_evaluated = true;
+    behavior_candidate.admission_rejection_reasons =
+        "GapNotStable|RearTtcTooSmall|MergeCorridorBlocked";
+    behavior_candidate.has_source_front_margin = true;
+    behavior_candidate.minimum_source_front_margin_m = -1.25;
+    behavior_candidate.source_front_limiting_vehicle_id = 10;
+    behavior_candidate.source_front_limiting_hypothesis =
+        "FrontConservativeBraking";
+    behavior_candidate.source_front_risk_observed = true;
+    behavior_candidate.first_source_front_risk_vehicle_id = 10;
+    behavior_candidate.first_source_front_risk_hypothesis =
+        "FrontConservativeBraking";
+    behavior_candidate.target_kinematic_failure_observed = true;
+    behavior_candidate.first_target_kinematic_failure_time_s = 4.3;
+    behavior_candidate.first_target_propagated_state_count = 128;
+    behavior_candidate.first_target_best_front_margin_m = -2.5;
+    behavior_candidate.gap_current_observation_valid = true;
+    behavior_candidate.topology_failure_observed = true;
+    behavior_candidate.first_topology_failure_kind =
+        "BoundariesNotAdjacent";
+    behavior_candidate.first_topology_actual_front_present = true;
+    behavior_candidate.first_topology_actual_front_vehicle_id = 30;
+    behavior_candidate.expected_boundaries_reversed_observed = true;
+    behavior_candidate.first_expected_boundaries_reversed_time_s = 3.8;
+    behavior_candidate.merge_corridor_intrusion_observed = true;
+    behavior_candidate.first_merge_corridor_intrusion_vehicle_id = 30;
+    behavior_candidate.first_merge_corridor_intrusion_hypothesis =
+        "LateralContinuation";
+    behavior_candidate.merge_corridor_blocked_observed = true;
+    behavior_candidate.first_merge_corridor_blocked_time_s = 4.3;
+    behavior_candidate.first_merge_corridor_candidate_state_count = 128;
+    behavior_candidate.first_merge_corridor_feasible_state_count = 0;
+    behavior_candidate.first_merge_corridor_blocking_vehicle_id = 30;
+    behavior_candidate.first_merge_corridor_blocking_hypothesis =
+        "LateralContinuation";
+    behavior_candidate.first_merge_corridor_blocking_margin_m = -3.5;
+    behavior_candidate.st_status = "CorridorEmpty";
+    behavior_candidate.final_status = "ValidationRejected";
+    behavior_candidate.final_rejection_detail = "Collision";
+    second.behavior_candidates.push_back(behavior_candidate);
+    second.behavior_evaluation_attempted = true;
+    second.behavior_evaluation_succeeded = true;
+    second.behavior_transaction_committed = true;
+    second.behavior_generated_candidate_count = 2;
+    second.behavior_coarse_admitted_count = 0;
+    second.shielded_same_lane_rear_vehicle_ids = {7.0, 8.0};
     second_monitor.Record(second);
+
   }
 
   const std::vector<std::string> cycle_lines = ReadLines(cycle_path);
   const std::vector<std::string> point_lines = ReadLines(point_path);
   const std::vector<std::string> qp_lines = ReadLines(qp_path);
+  const std::vector<std::string> control_candidate_lines =
+      ReadLines(control_candidate_path);
+  const std::vector<std::string> behavior_candidate_lines =
+      ReadLines(behavior_candidate_path);
+  const std::vector<std::string> collision_lines = ReadLines(collision_path);
   Expect(cycle_lines.size() == 2,
          "a new monitor run replaces the previous cycle log");
   Expect(cycle_lines.size() == 2 &&
@@ -396,6 +519,65 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
          "the clean point log contains only the new run");
   Expect(qp_lines.size() == 2 && qp_lines[1].find(",2,") != std::string::npos,
          "the clean QP log contains only the new run");
+  Expect(control_candidate_lines.size() == 2 &&
+             control_candidate_lines[1].find(",2,21,") != std::string::npos,
+         "the control-candidate log records each evaluated policy");
+  Expect(behavior_candidate_lines.size() == 2 &&
+             behavior_candidate_lines[1].find(
+                 ",2,31,ChangeLeft,1,0,") != std::string::npos &&
+             behavior_candidate_lines[1].find(
+                 "GapNotStable|RearTtcTooSmall|MergeCorridorBlocked") !=
+                 std::string::npos &&
+             behavior_candidate_lines[1].find(
+                 "BoundariesNotAdjacent") != std::string::npos,
+         "the behavior-candidate log records per-gate rejection evidence");
+  Expect(behavior_candidate_lines.front().find(
+             "minimum_source_front_margin_m") != std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "source_front_limiting_vehicle_id") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "first_topology_failure_time_s") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "first_topology_actual_front_vehicle_id") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "source_front_limiting_hypothesis") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "first_target_kinematic_failure_time_s") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "first_merge_corridor_intrusion_vehicle_id") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "expected_boundaries_reversed_observed") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "first_merge_corridor_blocked_time_s") !=
+                 std::string::npos &&
+             behavior_candidate_lines.front().find(
+                 "first_merge_corridor_blocking_margin_m") !=
+                 std::string::npos,
+         "behavior-candidate CSV exposes per-hypothesis source, coherent reachability and topology intrusion evidence");
+  Expect(cycle_lines.front().find("behavior_evaluation_attempted") !=
+             std::string::npos &&
+             cycle_lines.front().find("behavior_coarse_admitted_count") !=
+                 std::string::npos,
+         "cycle CSV exposes active evaluation health and stage counts");
+  Expect(cycle_lines.front().find("shielded_same_lane_rear_count") !=
+             std::string::npos &&
+             cycle_lines[1].find(",2,7|8,") != std::string::npos &&
+             control_candidate_lines.front().find(
+                 "shielded_same_lane_rear_object_ids") !=
+                 std::string::npos &&
+             control_candidate_lines[1].find(",2,7|8,") !=
+                 std::string::npos,
+         "cycle and candidate CSVs expose shielded rear counts and IDs");
+  Expect(collision_lines.size() == 2 &&
+             collision_lines[1].find(",99,") != std::string::npos,
+         "the collision-event log records per-object evidence");
   Expect(cycle_lines.size() == 2 &&
              CsvFieldCount(cycle_lines[0]) == CsvFieldCount(cycle_lines[1]),
          "cycle CSV header and data keep the same field count");
@@ -405,10 +587,25 @@ void TestRuntimeMonitorStartsWithCleanCsvLogs() {
   Expect(qp_lines.size() == 2 &&
              CsvFieldCount(qp_lines[0]) == CsvFieldCount(qp_lines[1]),
          "QP CSV header and data keep the same field count");
+  Expect(control_candidate_lines.size() == 2 &&
+             CsvFieldCount(control_candidate_lines[0]) ==
+                 CsvFieldCount(control_candidate_lines[1]),
+         "control-candidate CSV header and data keep the same field count");
+  Expect(behavior_candidate_lines.size() == 2 &&
+             CsvFieldCount(behavior_candidate_lines[0]) ==
+                 CsvFieldCount(behavior_candidate_lines[1]),
+         "behavior-candidate CSV header and data keep the same field count");
+  Expect(collision_lines.size() == 2 &&
+             CsvFieldCount(collision_lines[0]) ==
+                 CsvFieldCount(collision_lines[1]),
+         "collision CSV header and data keep the same field count");
 
   std::remove(cycle_path.c_str());
   std::remove(point_path.c_str());
   std::remove(qp_path.c_str());
+  std::remove(control_candidate_path.c_str());
+  std::remove(behavior_candidate_path.c_str());
+  std::remove(collision_path.c_str());
   std::remove(directory.c_str());
 }
 
@@ -477,11 +674,20 @@ void TestCartesianMonitorUsesAlignedStitchingFrame() {
 }
 
 void TestBaselinePlanner() {
-  const MapData map = SquareMap();
-  const SimulatorMessage parsed =
-      ParseSimulatorMessage(ValidTelemetryMessage());
-  PlannerInput empty_road = parsed.input;
-  empty_road.traffic.clear();
+  const MapData map = LoadMap("data/highway_map.csv");
+  PlannerInput empty_road;
+  empty_road.ego.s = 100.0;
+  empty_road.ego.d = 6.0;
+  empty_road.end_path_s = empty_road.ego.s;
+  empty_road.end_path_d = empty_road.ego.d;
+  const RoadGeometrySample initial_geometry =
+      EvaluateRoadGeometry(empty_road.ego.s, empty_road.ego.d, map);
+  empty_road.ego.x = initial_geometry.x;
+  empty_road.ego.y = initial_geometry.y;
+  empty_road.ego.yaw_deg =
+      std::atan2(initial_geometry.first_derivative_y,
+                 initial_geometry.first_derivative_x) *
+      180.0 / 3.14159265358979323846;
   PathPlanner planner;
   const PlannerOutput first = planner.Plan(empty_road, map);
   Expect(first.next_x.size() == 50, "planner returns 50 x points");
@@ -504,17 +710,33 @@ void TestBaselinePlanner() {
              !first_diagnostics.qp_jerk_violation,
          "baseline QP diagnostics remain inside hard bounds");
 
+  const PlannerCycleDiagnostics first_cycle = planner.last_diagnostics();
   PlannerInput with_history = empty_road;
-  with_history.previous_path_x = {11.0, 12.0};
-  with_history.previous_path_y = {21.0, 22.0};
-  with_history.end_path_s = 5.0;
-  with_history.end_path_d = 6.0;
+  with_history.previous_path_x.assign(first.next_x.end() - 2,
+                                      first.next_x.end());
+  with_history.previous_path_y.assign(first.next_y.end() - 2,
+                                      first.next_y.end());
+  with_history.ego.x = first.next_x[47];
+  with_history.ego.y = first.next_y[47];
+  with_history.ego.s =
+      first_cycle.output_lateral_states[47].road_parameter_s;
+  with_history.ego.d = first_cycle.output_lateral_states[47].planned_d;
+  with_history.ego.speed_mph =
+      first_cycle.output_longitudinal_states[47].v / 0.44704;
+  with_history.ego.yaw_deg =
+      std::atan2(first.next_y[47] - first.next_y[46],
+                 first.next_x[47] - first.next_x[46]) *
+      180.0 / 3.14159265358979323846;
+  with_history.end_path_s =
+      first_cycle.output_lateral_states.back().road_parameter_s;
+  with_history.end_path_d =
+      first_cycle.output_lateral_states.back().planned_d;
   const PlannerOutput continued = planner.Plan(with_history, map);
   Expect(continued.next_x.size() == 50,
          "continued path is replenished to 50 points");
-  ExpectNear(continued.next_x[0], 11.0, 1e-9,
+  ExpectNear(continued.next_x[0], with_history.previous_path_x[0], 1e-9,
              "first historical x point is preserved");
-  ExpectNear(continued.next_y[1], 22.0, 1e-9,
+  ExpectNear(continued.next_y[1], with_history.previous_path_y[1], 1e-9,
              "historical y points are preserved");
 
   const std::string control = MakeControlMessage(continued);
@@ -523,23 +745,37 @@ void TestBaselinePlanner() {
 }
 
 void TestPlannerStartsWithHistory() {
-  const MapData map = SquareMap();
-  const SimulatorMessage parsed =
-      ParseSimulatorMessage(ValidTelemetryMessage());
-  PlannerInput input = parsed.input;
-  input.traffic.clear();
-  input.previous_path_x = {1.0, 1.01};
-  input.previous_path_y = {2.0, 2.0};
-  input.end_path_s = 5.0;
-  input.end_path_d = 6.0;
+  const MapData map = LoadMap("data/highway_map.csv");
+  PlannerInput input;
+  input.ego.s = 100.0;
+  input.ego.d = 6.0;
+  input.ego.speed_mph = 10.0 / 0.44704;
+  const RoadGeometrySample ego_geometry =
+      EvaluateRoadGeometry(input.ego.s, input.ego.d, map);
+  input.ego.x = ego_geometry.x;
+  input.ego.y = ego_geometry.y;
+  input.ego.yaw_deg =
+      std::atan2(ego_geometry.first_derivative_y,
+                 ego_geometry.first_derivative_x) *
+      180.0 / 3.14159265358979323846;
+  double road_s = input.ego.s;
+  for (int index = 0; index < 2; ++index) {
+    road_s = AdvanceRoadParameter(road_s, 0.2, input.ego.d, map);
+    const RoadGeometrySample point =
+        EvaluateRoadGeometry(road_s, input.ego.d, map);
+    input.previous_path_x.push_back(point.x);
+    input.previous_path_y.push_back(point.y);
+  }
+  input.end_path_s = road_s;
+  input.end_path_d = input.ego.d;
 
   PathPlanner planner;
   const PlannerOutput output = planner.Plan(input, map);
   Expect(output.next_x.size() == 50 && output.next_y.size() == 50,
          "a fresh planner accepts an existing previous path");
-  ExpectNear(output.next_x[0], 1.0, 1e-12,
+  ExpectNear(output.next_x[0], input.previous_path_x[0], 1e-12,
              "fresh-planner history remains unchanged");
-  ExpectNear(output.next_y[1], 2.0, 1e-12,
+  ExpectNear(output.next_y[1], input.previous_path_y[1], 1e-12,
              "fresh-planner history y remains unchanged");
 }
 
@@ -574,7 +810,7 @@ void TestColdStartUsesHistoricalEndpointState() {
   PathPlanner planner;
   const PlannerOutput output = planner.Plan(input, map);
   const PlannerCycleDiagnostics &diagnostics = planner.last_diagnostics();
-  const std::size_t junction = input.previous_path_x.size();
+  const std::size_t junction = diagnostics.previous_path_size;
   const double incoming_speed =
       std::hypot(output.next_x[junction - 1] - output.next_x[junction - 2],
                  output.next_y[junction - 1] - output.next_y[junction - 2]) /
@@ -984,6 +1220,7 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
   double maximum_end_lateral_error = 0.0;
   int reset_count = 0;
   LongitudinalState expected_frontier_state;
+  double expected_frontier_progress = 0.0;
   bool expected_frontier_valid = false;
   for (int cycle = 0; cycle < 700; ++cycle) {
     const PlannerOutput output = planner.Plan(input, map);
@@ -1008,11 +1245,12 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
                  fixed_terminal_progress, 1e-12,
                  "rolling quintic keeps one absolute terminal progress");
       const bool should_roll =
-          previous_progress + 1e-6 < fixed_terminal_progress;
+          expected_frontier_progress + 1e-6 < fixed_terminal_progress;
       Expect(diagnostics.lateral.rolling_replanned == should_roll,
              "active transition refits once at each rolling frontier");
       if (should_roll) {
-        ExpectNear(diagnostics.lateral.rolling_origin_m, previous_progress,
+        ExpectNear(diagnostics.lateral.rolling_origin_m,
+                   expected_frontier_progress,
                    1e-8, "new quintic starts at the previous planned frontier");
         Expect(diagnostics.lateral.rolling_replan_count ==
                    previous_rolling_replan_count + 1,
@@ -1053,11 +1291,15 @@ void TestFixedTerminalRollingTransitionWithQuantizedHistory() {
       Expect(state.planned_d >= 4.0 && state.planned_d <= 8.0,
              "quintic lateral profile remains inside the locked lane");
     }
-    expected_frontier_state = diagnostics.output_longitudinal_states.back();
-    expected_frontier_valid = true;
-
     const std::size_t consumed_points =
         2U + static_cast<std::size_t>(cycle % 6);
+    const std::size_t next_frontier_index = consumed_points + 15U - 1U;
+    expected_frontier_state =
+        diagnostics.output_longitudinal_states[next_frontier_index];
+    expected_frontier_progress =
+        diagnostics.output_lateral_states[next_frontier_index]
+            .correction_progress_m;
+    expected_frontier_valid = true;
     const LateralPathState &ego_lateral_state =
         diagnostics.output_lateral_states[consumed_points - 1];
     const double ego_x = RoundToMillimeter(output.next_x[consumed_points - 1]);
@@ -1154,29 +1396,73 @@ void TestEndPathDriftCannotChangeLockedLane() {
   planner.Plan(input, map);
   ExpectNear(planner.last_diagnostics().lane_center_d, 6.0, 1e-12,
              "drifting end_path_d cannot change the locked target lane");
-  Expect(planner.last_diagnostics().lane_deviation_violation,
-         "monitor reports a large end_path_d deviation from the locked lane");
+  Expect(!planner.last_diagnostics().lane_deviation_violation,
+         "exact retained state prevents end_path_d drift from moving the "
+         "planning frontier");
 }
 
-PlannerInput HighwayInput(double speed_mph) {
+PlannerInput HighwayInput(double speed_mph, const MapData &map) {
   PlannerInput input;
   input.ego.s = 100.0;
   input.ego.d = 6.0;
   input.ego.speed_mph = speed_mph;
   input.end_path_s = input.ego.s;
   input.end_path_d = input.ego.d;
+  const RoadGeometrySample geometry =
+      EvaluateRoadGeometry(input.ego.s, input.ego.d, map);
+  input.ego.x = geometry.x;
+  input.ego.y = geometry.y;
+  input.ego.yaw_deg =
+      std::atan2(geometry.first_derivative_y,
+                 geometry.first_derivative_x) *
+      180.0 / 3.14159265358979323846;
   return input;
 }
 
 void TestPlannerTrafficResponse() {
   const MapData map = LoadMap("data/highway_map.csv");
-  PlannerInput free_input = HighwayInput(45.0);
+  PlannerInput free_input = HighwayInput(45.0, map);
 
   PathPlanner free_planner;
   free_planner.Plan(free_input, map);
   const double free_speed = free_planner.reference_speed_mps();
   Expect(!free_planner.last_plan_emergency(),
          "free-road plan does not use emergency fallback");
+
+  PlannerInput fast_rear_input = free_input;
+  DetectedVehicle fast_rear;
+  fast_rear.id = 0.0;
+  fast_rear.s = 70.0;
+  fast_rear.d = 6.0;
+  const RoadGeometrySample fast_rear_geometry =
+      EvaluateRoadGeometry(fast_rear.s, fast_rear.d, map);
+  fast_rear.x = fast_rear_geometry.x;
+  fast_rear.y = fast_rear_geometry.y;
+  SetFrenetVelocity(&fast_rear, 30.0, 0.0, map);
+  fast_rear_input.traffic.push_back(fast_rear);
+
+  PathPlanner fast_rear_planner;
+  const PlanningCycleDecision fast_rear_decision =
+      fast_rear_planner.PlanCycle(fast_rear_input, map);
+  const PlannerCycleDiagnostics &fast_rear_diagnostics =
+      fast_rear_planner.last_diagnostics();
+  Expect(fast_rear_decision.disposition ==
+             PlanDisposition::kValidatedCandidate &&
+             fast_rear_decision.has_validated_candidate &&
+             !fast_rear_planner.last_plan_emergency(),
+         "a faster same-lane rear vehicle cannot trigger emergency braking");
+  Expect(fast_rear_diagnostics
+                 .shielded_same_lane_rear_vehicle_ids.size() == 1 &&
+             fast_rear_diagnostics
+                     .shielded_same_lane_rear_vehicle_ids.front() ==
+                 fast_rear.id &&
+             !fast_rear_diagnostics.has_first_collision_evidence,
+         "planner diagnostics expose the shielded rear object without a hard "
+         "collision event");
+  Expect(fast_rear_diagnostics.control_candidates.size() == 1 &&
+             fast_rear_diagnostics.control_candidates.front()
+                     .shielded_same_lane_rear_vehicle_ids.size() == 1,
+         "the selected normal candidate records rear shielding");
 
   PlannerInput following_input = free_input;
   DetectedVehicle slow_lead;
@@ -1196,7 +1482,8 @@ void TestPlannerTrafficResponse() {
   const double matched_speed_mps = 15.0;
   const double desired_gap_meters = 2.0 + 1.0 + 4.8 + 1.5 * matched_speed_mps;
   const double gap_surplus_meters = 12.0;
-  PlannerInput gap_closing_input = HighwayInput(matched_speed_mps / 0.44704);
+  PlannerInput gap_closing_input =
+      HighwayInput(matched_speed_mps / 0.44704, map);
   DetectedVehicle matched_lead;
   matched_lead.id = 15.0;
   matched_lead.s =
@@ -1213,7 +1500,9 @@ void TestPlannerTrafficResponse() {
   ExpectNear(gap_closing_diagnostics.reference_first_mps,
              matched_speed_mps + gap_surplus_meters / 6.0, 1e-3,
              "planner uses actual ego speed and distance surplus for gradual "
-             "gap closing");
+             "gap closing: actual=" +
+                 std::to_string(
+                     gap_closing_diagnostics.reference_first_mps));
 
   PlannerInput intrusion_input = free_input;
   DetectedVehicle intruding_neighbor;
@@ -1289,6 +1578,23 @@ void TestPlannerTrafficResponse() {
   Expect(emergency_planner.reference_speed_mps() <
              blocked_input.ego.speed_mph * 0.44704,
          "emergency fallback commands a lower speed");
+  const PlannerCycleDiagnostics &emergency_diagnostics =
+      emergency_planner.last_diagnostics();
+  Expect(emergency_diagnostics.control_candidates.size() == 4,
+         "emergency diagnostics retain all three ordinary attempts and MRM");
+  Expect(emergency_diagnostics.has_first_collision_evidence &&
+             emergency_diagnostics.first_collision.evidence.object_id ==
+                 blocked_lead.id,
+         "emergency diagnostics identify the first collision object");
+  if (emergency_diagnostics.control_candidates.size() == 4) {
+    const ControlCandidateDiagnostics &mrm =
+        emergency_diagnostics.control_candidates.back();
+    Expect(mrm.minimum_risk_candidate && mrm.selected_for_dispatch &&
+               !mrm.validation_valid && !mrm.collision_events.empty(),
+           "MRM attempt remains explicitly invalid with collision evidence");
+    Expect(mrm.collision_events.front().qp_relevant,
+           "collision diagnostics identify a same-lane QP obstacle");
+  }
 }
 
 } // namespace
@@ -1297,6 +1603,8 @@ int main() {
   RunTest(TestMapBoundaries, "TestMapBoundaries");
   RunTest(TestHighwayMapLoading, "TestHighwayMapLoading");
   RunTest(TestHighwayMapSplineContinuity, "TestHighwayMapSplineContinuity");
+  RunTest(TestRoadArcLengthIndexRoundTrip,
+          "TestRoadArcLengthIndexRoundTrip");
   RunTest(TestProtocolContract, "TestProtocolContract");
   RunTest(TestCartesianRuntimeMonitor, "TestCartesianRuntimeMonitor");
   RunTest(TestRuntimeMonitorStartsWithCleanCsvLogs,

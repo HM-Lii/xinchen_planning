@@ -52,6 +52,8 @@ int main() {
       }
       std::cout << "Connected" << std::endl;
       PlannerConfig planner_config;
+      planner_config.operating_mode =
+          PlannerOperatingMode::kBehaviorActive;
       planner_config.monitor.enabled = true;
       planner_config.monitor.write_csv = true;
       PathPlanner planner(planner_config);

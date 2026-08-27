@@ -1,7 +1,41 @@
 #ifndef PLANNER_TYPES_H
 #define PLANNER_TYPES_H
 
+#include <cstddef>
+#include <cstdint>
 #include <vector>
+
+enum class PlannerOperatingMode {
+  kLaneCruiseOnly,
+  kBehaviorActive
+};
+
+enum class PlanningStateSource {
+  kTelemetry,
+  kExactInherited,
+  kColdStartProjected
+};
+
+enum class PlanningStateResetReason {
+  kNone,
+  kNoCommittedHistory,
+  kHistoryLengthMismatch,
+  kHistoryPositionMismatch
+};
+
+enum class FallbackLevel {
+  kNormal,
+  kDegradedBraking,
+  kMaximumBraking,
+  kMinimumRisk,
+  kInfrastructureFailure
+};
+
+enum class PlanDisposition {
+  kValidatedCandidate,
+  kMinimumRiskDispatch,
+  kInfrastructureFailure
+};
 
 struct MapData {
   std::vector<double> x;

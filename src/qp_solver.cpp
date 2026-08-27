@@ -31,8 +31,9 @@ struct CscStorage {
 
   OSQPCscMatrix Matrix() {
     OSQPCscMatrix result;
-    csc_set_data(&result, rows, columns, static_cast<OSQPInt>(values.size()),
-                 values.data(), row_indices.data(), column_pointers.data());
+    OSQPCscMatrix_set_data(
+        &result, rows, columns, static_cast<OSQPInt>(values.size()),
+        values.data(), row_indices.data(), column_pointers.data());
     return result;
   }
 };
@@ -159,8 +160,26 @@ std::vector<OSQPFloat> ConvertVector(const Eigen::VectorXd &source,
 } // namespace
 
 QpSolverResult QpSolver::Solve(const QuadraticProgram &problem,
-                               const Eigen::VectorXd *warm_start) const {
+                               const Eigen::VectorXd *warm_start,
+                               const QpSolverOptions &options) const {
   ValidateProblem(problem);
+  if (options.maximum_iterations <= 0 ||
+      !std::isfinite(options.absolute_tolerance) ||
+      options.absolute_tolerance <= 0.0 ||
+      !std::isfinite(options.relative_tolerance) ||
+      options.relative_tolerance <= 0.0 ||
+      !std::isfinite(options.time_limit_seconds) ||
+      options.time_limit_seconds < 0.0) {
+    throw std::invalid_argument("invalid QP solver options");
+  }
+  if (warm_start != nullptr && warm_start->size() == problem.hessian.rows()) {
+    for (Eigen::Index index = 0; index < warm_start->size(); ++index) {
+      if (!std::isfinite((*warm_start)[index])) {
+        throw std::invalid_argument(
+            "QP warm start contains a non-finite value");
+      }
+    }
+  }
 
   CscStorage hessian_storage = ConvertMatrix(problem.hessian, true);
   CscStorage constraint_storage =
@@ -175,10 +194,19 @@ QpSolverResult QpSolver::Solve(const QuadraticProgram &problem,
   osqp_set_default_settings(&settings);
   settings.verbose = 0;
   settings.warm_starting = 1;
-  settings.max_iter = 6000;
-  settings.eps_abs = 1e-5;
-  settings.eps_rel = 1e-5;
+  settings.max_iter = options.maximum_iterations;
+  settings.eps_abs = options.absolute_tolerance;
+  settings.eps_rel = options.relative_tolerance;
   settings.polishing = 1;
+  // OSQP's zero default selects a timing-based adaptive-rho interval. That
+  // makes the numerical path depend on concurrent auxiliary CPU load. A fixed
+  // interval keeps identical control problems bitwise reproducible while
+  // retaining adaptive rho updates.
+  settings.adaptive_rho_interval = 50;
+  if (options.time_limit_seconds > 0.0) {
+    settings.time_limit =
+        static_cast<OSQPFloat>(options.time_limit_seconds);
+  }
 
   OSQPSolver *raw_solver = nullptr;
   const OSQPInt setup_error =
@@ -215,12 +243,26 @@ QpSolverResult QpSolver::Solve(const QuadraticProgram &problem,
   result.status = StatusName(solver->info->status_val);
   result.success = solver->info->status_val == OSQP_SOLVED ||
                    solver->info->status_val == OSQP_SOLVED_INACCURATE;
-  result.objective = solver->info->obj_val;
+  const double objective = static_cast<double>(solver->info->obj_val);
+  if (std::isfinite(objective)) {
+    result.objective = objective;
+  } else if (result.success) {
+    result.success = false;
+    result.status = "OSQP returned a non-finite objective";
+    return result;
+  }
   if (result.success && solver->solution != nullptr &&
       solver->solution->x != nullptr) {
     result.primal.resize(problem.hessian.rows());
     for (Eigen::Index index = 0; index < result.primal.size(); ++index) {
-      result.primal[index] = solver->solution->x[index];
+      const double value = static_cast<double>(solver->solution->x[index]);
+      if (!std::isfinite(value)) {
+        result.success = false;
+        result.status = "OSQP returned a non-finite primal solution";
+        result.primal.resize(0);
+        return result;
+      }
+      result.primal[index] = value;
     }
   } else if (result.success) {
     result.success = false;
